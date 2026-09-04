@@ -28,7 +28,8 @@ enum {
     ROPE_HALF = 48,
     SLOTS = 6,
     FINAL_SLOTS = 2,
-    VDN_WINDOW_BATCH_CAP = 4
+    VDN_WINDOW_BATCH_CAP = 4,
+    VDN_INT8_ATTENTION_OUT_MAX_ROWS = 8192
 };
 
 typedef struct {
@@ -1844,13 +1845,20 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->vdn && !dit->ssd_streaming &&
+    dit->int8_qkv = !dit->ssd_streaming &&
                     !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->vdn && !dit->ssd_streaming &&
+    /* VDN produces row-major window outputs. Its ordinary int8 projection is
+     * faster for the measured 6.5K-row case, but crosses behind MPS BF16 at
+     * the 41K-row production shape. Keep the proven small-sequence path while
+     * avoiding that large-sequence regression. */
+    dit->int8_attention_out = !dit->ssd_streaming &&
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
+                              (!dit->vdn ||
+                               dit->sequence <=
+                                   VDN_INT8_ATTENTION_OUT_MAX_ROWS) &&
                               h3_gpu_has_int8_mlp(dit->gpu);
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
@@ -2430,9 +2438,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
     if (dit->vdn) {
-        OP(h3_gpu_linear_bf16(
-            dit->gpu, dit->qkv, dit->mod_attention, weight->qkv, NULL,
-            rows, HIDDEN, INNER * 3), "VDN raw QKV projection");
+        if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV"))
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, dit->qkv, dit->int8_activation,
+                dit->int8_activation_scales, dit->mod_attention,
+                weight->qkv_int8, weight->qkv_scales,
+                rows, HIDDEN, INNER * 3,
+                dit->use_slower_uncached_int8_scales),
+               "VDN int8 raw QKV projection");
+        else
+            OP(h3_gpu_linear_bf16(
+                dit->gpu, dit->qkv, dit->mod_attention, weight->qkv, NULL,
+                rows, HIDDEN, INNER * 3), "VDN raw QKV projection");
         OP(h3_gpu_grouped_qkv_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,
@@ -2460,6 +2477,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
+        !dit->vdn &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
@@ -2561,6 +2579,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
             dit->schedule, next_index);
         int fuse_int8_qkv_input = dit->int8_qkv &&
+            !dit->vdn &&
             !dit->use_slower_unfused_int8_inputs &&
             !getenv("H3_DISABLE_INT8_QKV") &&
             !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");

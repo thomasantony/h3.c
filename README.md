@@ -103,6 +103,14 @@ path is implemented. VDN also cannot be combined with `--token-reduction` or
 hybrid window planner accepts every frame count supported by h3.c, including a
 short final chunk in the five-frame window partition.
 
+On supported M5 Metal 4 hardware, VDN quantizes the LoRA-adapted QKV weights
+after merging them on the GPU. This keeps the branch's required raw QKV tensor
+while using the faster projection backend. The row-major attention-output
+projection also uses int8 through 8,192 packed rows; longer VDN sequences stay
+on BF16 because the int8 kernel crosses behind MPS at that size. Use
+`--use-slower-bf16-qkv` and `--use-slower-bf16-attention-output` for the
+close-reference projections at any supported sequence length.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps
