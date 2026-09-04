@@ -5627,8 +5627,9 @@ static int h3_gpu_linear_int8_bf16_layout(
                    @"int8 linear input")) return 0;
     BOOL local_scales = !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
-    BOOL known_linear = local_scales && rows <= 2048 && input_dim == 7168 &&
+    BOOL known_linear = local_scales && input_dim == 7168 &&
         output_dim == 5376 &&
+        (rows <= 2048 || getenv("H3_INT8_LINEAR_KNOWN_LONG")) &&
         getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
