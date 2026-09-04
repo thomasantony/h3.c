@@ -5929,7 +5929,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
                                strcmp(stage, "bf16"));
     BOOL fc1_row256_requested = int8_fc1 && input_dim == 5376u &&
-        hidden_dim == 14336u && rows >= 256u &&
+        hidden_dim == 14336u && output_dim == 5376u && rows >= 256u &&
         getenv("H3_INT8_FC1_ROW256") != NULL;
     uint32_t padded_rows = (rows + 127u) & ~127u;
     uint32_t fc1_padded_rows = fc1_row256_requested ?
