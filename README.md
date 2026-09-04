@@ -165,7 +165,7 @@ H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
 H3_VDN_STATS_GATE_REUSE=1 H3_INT8_LINEAR_KNOWN_LONG=1 \
 H3_VDN_DECAY_CHUNKED=1 H3_VDN_LINEAR_KNOWN=1 H3_INT8_LINEAR_ROW256=1 \
-H3_INT8_FC1_ROW256=1 \
+H3_INT8_FC1_ROW256=1 H3_INT8_FC2_ROW256_LONG=1 \
 H3_VDN_MPS_CHOLESKY=1 \
 H3_MPSGRAPH_EXECUTABLE=1 \
 ./h3_dit_bench_full MiniMax-H3
@@ -231,6 +231,9 @@ with automatic fallback to the 128-row kernels when the device cannot dispatch
 `H3_INT8_FC1_ROW256=1` applies the same wider-row strategy to the fixed
 5,376->14,336 SwiGLU FC1 projection used by every H3 block; the activation
 arena is padded to 256 rows and the 128-row kernel remains the fallback.
+`H3_INT8_FC2_ROW256_LONG=1` extends the row-scaled 128x256 FC2 tile to long
+sequences such as the 35-block 864x480 benchmark. It is opt-in because the
+existing 128x128-output tile remains faster on some devices.
 `H3_INT8_LINEAR_KNOWN_LONG=1` extends the compile-time 7,168→5,376 int8
 projection kernel to long VDN row counts; it is opt-in because the generic
 dynamic-shape kernel can win on some devices.

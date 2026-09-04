@@ -6037,7 +6037,11 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         if (parsed >= 0.1f && parsed <= 1.0f) activation_clip = parsed;
     }
     BOOL grouped_fc2 = int8_fc2 && !use_int8_row_fc2;
-    BOOL row_fc2_n256 = use_int8_row_fc2 && rows <= 2048;
+    /* The 128x256 full-K tile was validated for short rows first.  Long VDN
+     * sequences can opt into it explicitly; keep the measured short-row
+     * default and the existing 128x128 fallback unchanged. */
+    BOOL row_fc2_n256 = use_int8_row_fc2 &&
+        (rows <= 2048 || getenv("H3_INT8_FC2_ROW256_LONG"));
     BOOL grouped_fc2_local = grouped_fc2 &&
         getenv("H3_INT8_GROUP_FC2_THREADGROUP") == NULL;
     BOOL grouped_fc2_local128 = grouped_fc2 &&
