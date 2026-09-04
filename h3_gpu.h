@@ -317,6 +317,14 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim);
+/* Prefer native BF16 TensorOps in bounded row chunks when that backend is
+ * available, otherwise retain the ordinary MPSGraph linear fallback. */
+int h3_gpu_linear_bf16_split_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim,
+                       uint32_t split_rows);
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,

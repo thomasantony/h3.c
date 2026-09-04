@@ -111,6 +111,16 @@ on BF16 because the int8 kernel crosses behind MPS at that size. Use
 `--use-slower-bf16-qkv` and `--use-slower-bf16-attention-output` for the
 close-reference projections at any supported sequence length.
 
+The long-sequence BF16 projections now use bounded Metal 4 TensorOps tiles,
+and the VDN query, temporal-convolution, and epilogue kernels use exact
+four-wide BF16 memory operations. At 864x480 with 102 latent frames on an M5
+Max, these changes reduced a 35-block core forward from 41.73 seconds to about
+33.50 seconds without changing its output bytes. For a sub-30-second speed
+preset, `--layers 25` completed the same benchmark in 22.97 seconds. Layer
+reduction uses the existing gate-ranked block policy and is a quality/speed
+tradeoff; keep 35 or more active blocks when matching the previous output is
+more important than reaching the sub-30-second target.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps

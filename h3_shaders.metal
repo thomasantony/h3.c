@@ -237,6 +237,42 @@ kernel void h3_vdn_query_feature_bf16(
             h3_bf16_to_f32(query[output + d]) * inverse);
 }
 
+kernel void h3_vdn_query_feature_vec4_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device ushort *query [[buffer(1)]],
+                                constant vdn_feature_args &args [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint output = ((frame * args.heads + head) * args.tokens_per_frame + token) *
+                  args.head_dim;
+    device ushort4 *query4 =
+        reinterpret_cast<device ushort4 *>(query + output);
+    float sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d += 4) {
+        uint source = h3_vdn_grouped_index(
+            args.source_row + row, head, 0, d, args.heads, args.head_dim);
+        float4 value = h3_bf16x4_to_f32(
+            *reinterpret_cast<device const ushort4 *>(qkv + source));
+        float4 activated = value / (1.0f + exp(-value));
+        ushort4 feature = h3_f32x4_to_bf16(activated);
+        query4[d / 4] = feature;
+        float4 rounded = h3_bf16x4_to_f32(feature);
+        sum = fma(rounded.x, rounded.x, sum);
+        sum = fma(rounded.y, rounded.y, sum);
+        sum = fma(rounded.z, rounded.z, sum);
+        sum = fma(rounded.w, rounded.w, sum);
+    }
+    float inverse = rsqrt(max(sum, 1.0e-24f));
+    for (uint d = 0; d < args.head_dim; d += 4)
+        query4[d / 4] = h3_f32x4_to_bf16(
+            h3_bf16x4_to_f32(query4[d / 4]) * inverse);
+}
+
 kernel void h3_vdn_spatial_feature_bf16(
                                 device const ushort *qkv [[buffer(0)]],
                                 device const ushort *weight [[buffer(1)]],
@@ -311,6 +347,57 @@ kernel void h3_vdn_temporal_feature_bf16(
         for (uint d = 0; d < args.head_dim; d++)
             output[base + d] = h3_f32_to_bf16(
                 h3_bf16_to_f32(output[base + d]) * inverse);
+    }
+}
+
+kernel void h3_vdn_temporal_feature_vec4_bf16(
+                                device const ushort *spatial [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device ushort *output [[buffer(2)]],
+                                constant vdn_feature_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint base = (row * args.heads + head) * args.head_dim;
+    device ushort4 *output4 =
+        reinterpret_cast<device ushort4 *>(output + base);
+    float sum_sq = 0.0f;
+    for (uint d = 0; d < args.head_dim; d += 4) {
+        uint channel = head * args.head_dim + d;
+        float4 sum = 0.0f;
+        for (int kt = -2; kt <= 2; kt++) {
+            int sf = int(frame) + kt;
+            if (sf < 0 || sf >= int(args.frames)) continue;
+            uint source_row = uint(sf) * args.tokens_per_frame + token;
+            uint source = (source_row * args.heads + head) * args.head_dim + d;
+            float4 value = h3_bf16x4_to_f32(
+                *reinterpret_cast<device const ushort4 *>(spatial + source));
+            uint tap = uint(kt + 2);
+            ushort4 weight_bits = ushort4(
+                weight[(channel + 0) * 5 + tap],
+                weight[(channel + 1) * 5 + tap],
+                weight[(channel + 2) * 5 + tap],
+                weight[(channel + 3) * 5 + tap]);
+            sum = fma(value, h3_bf16x4_to_f32(weight_bits), sum);
+        }
+        float4 activated = sum / (1.0f + exp(-sum));
+        ushort4 feature = h3_f32x4_to_bf16(activated);
+        output4[d / 4] = feature;
+        float4 rounded = h3_bf16x4_to_f32(feature);
+        sum_sq = fma(rounded.x, rounded.x, sum_sq);
+        sum_sq = fma(rounded.y, rounded.y, sum_sq);
+        sum_sq = fma(rounded.z, rounded.z, sum_sq);
+        sum_sq = fma(rounded.w, rounded.w, sum_sq);
+    }
+    if (args.l2_normalize) {
+        float inverse = rsqrt(max(sum_sq, 1.0e-24f));
+        for (uint d = 0; d < args.head_dim; d += 4)
+            output4[d / 4] = h3_f32x4_to_bf16(
+                h3_bf16x4_to_f32(output4[d / 4]) * inverse);
     }
 }
 
@@ -537,6 +624,47 @@ kernel void h3_vdn_epilogue_bf16(
         float value = h3_bf16_to_f32(readout[source + d]) * inverse *
                       h3_bf16_to_f32(weight[d]) * sigmoid;
         output[destination + d] = h3_f32_to_bf16(value);
+    }
+}
+
+kernel void h3_vdn_epilogue_vec4_bf16(
+                                device const ushort *readout [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device const ushort *gate [[buffer(2)]],
+                                device ushort *output [[buffer(3)]],
+                                constant vdn_epilogue_args &args [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens;
+    uint token = row - frame * args.tokens;
+    uint source = ((frame * args.heads + head) * args.tokens + token) * args.dim;
+    uint destination = (row * args.heads + head) * args.dim;
+    device const ushort4 *readout4 =
+        reinterpret_cast<device const ushort4 *>(readout + source);
+    device const ushort4 *weight4 =
+        reinterpret_cast<device const ushort4 *>(weight);
+    device const ushort4 *gate4 =
+        reinterpret_cast<device const ushort4 *>(gate + destination);
+    device ushort4 *output4 =
+        reinterpret_cast<device ushort4 *>(output + destination);
+    float sum = 0.0f;
+    for (uint d = 0; d < args.dim; d += 4) {
+        float4 value = h3_bf16x4_to_f32(readout4[d / 4]);
+        sum = fma(value.x, value.x, sum);
+        sum = fma(value.y, value.y, sum);
+        sum = fma(value.z, value.z, sum);
+        sum = fma(value.w, value.w, sum);
+    }
+    float inverse = rsqrt(sum / float(args.dim) + args.epsilon);
+    for (uint d = 0; d < args.dim; d += 4) {
+        float4 logit = h3_bf16x4_to_f32(gate4[d / 4]);
+        float4 sigmoid = 1.0f / (1.0f + exp(-logit));
+        float4 value = h3_bf16x4_to_f32(readout4[d / 4]) * inverse *
+                       h3_bf16x4_to_f32(weight4[d / 4]) * sigmoid;
+        output4[d / 4] = h3_f32x4_to_bf16(value);
     }
 }
 

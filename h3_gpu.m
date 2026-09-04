@@ -444,12 +444,16 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_lora_merge_swap_halves_bf16",
             @"h3_vdn_gate_heads_bf16",
             @"h3_vdn_text_features_bf16", @"h3_vdn_query_feature_bf16",
+            @"h3_vdn_query_feature_vec4_bf16",
             @"h3_vdn_spatial_feature_bf16",
-            @"h3_vdn_temporal_feature_bf16", @"h3_vdn_frame_mean_f32",
+            @"h3_vdn_temporal_feature_bf16",
+            @"h3_vdn_temporal_feature_vec4_bf16",
+            @"h3_vdn_frame_mean_f32",
             @"h3_vdn_linear_f32_bf16", @"h3_vdn_alpha_f32",
             @"h3_vdn_cholesky_solve_f32", @"h3_vdn_pack_solve_f32",
             @"h3_vdn_scale_f32", @"h3_vdn_gather_state_bf16",
-            @"h3_vdn_epilogue_bf16", @"h3_vdn_add_projected_bf16",
+            @"h3_vdn_epilogue_bf16", @"h3_vdn_epilogue_vec4_bf16",
+            @"h3_vdn_add_projected_bf16",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
             @"h3_linear_f32_tiled_bf16_map",
             @"h3_cast_f32_to_bf16",
@@ -1844,7 +1848,11 @@ int h3_gpu_vdn_query_feature_bf16(
         source_row, frames, tokens_per_frame, 0, 0,
         heads, head_dim, 0, 1
     };
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_query_feature_bf16",
+    NSString *pipeline = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_QUERY_VEC4") ?
+        @"h3_vdn_query_feature_vec4_bf16" :
+        @"h3_vdn_query_feature_bf16";
+    return h3_gpu_dispatch_2d(gpu, pipeline,
         (uint32_t)rows, heads, ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:1];
@@ -1902,7 +1910,11 @@ int h3_gpu_vdn_temporal_feature_bf16(
         0, frames, tokens_per_frame, 0, 0,
         heads, head_dim, 0, l2_normalize != 0
     };
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_temporal_feature_bf16",
+    NSString *pipeline = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_TEMPORAL_VEC4") ?
+        @"h3_vdn_temporal_feature_vec4_bf16" :
+        @"h3_vdn_temporal_feature_bf16";
+    return h3_gpu_dispatch_2d(gpu, pipeline,
         (uint32_t)rows, heads, ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(spatial).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
@@ -2431,7 +2443,10 @@ int h3_gpu_vdn_epilogue_bf16(
         uint32_t frames, tokens, heads, dim; float epsilon;
     } args_type;
     args_type args = {frames, tokens, heads, dim, epsilon};
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_epilogue_bf16",
+    NSString *pipeline = dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_EPILOGUE_VEC4") ?
+        @"h3_vdn_epilogue_vec4_bf16" : @"h3_vdn_epilogue_bf16";
+    return h3_gpu_dispatch_2d(gpu, pipeline,
         (uint32_t)rows, heads, ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(readout).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:1];
@@ -3289,11 +3304,12 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
-int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+static int h3_gpu_linear_bf16_impl(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
-                       uint32_t input_dim, uint32_t output_dim) {
+                       uint32_t input_dim, uint32_t output_dim,
+                       uint32_t forced_split_rows) {
     H3GPU *gpu = GPU(opaque);
     size_t input_count = (size_t)rows * input_dim;
     size_t weight_count = (size_t)output_dim * input_dim;
@@ -3303,11 +3319,14 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
     const char *splitRowsValue = getenv("H3_NAX_SPLIT_ROWS");
+    BOOL forceSplitRows = forced_split_rows >= 128 &&
+        forced_split_rows <= 2048;
     BOOL autoSplitRows = gpu.tensorOpsEnabled && rows > 2048 && rows <= 3072 &&
         (gpu.tensorOpsMode == 2 || gpu.tensorOpsMode == 3 ||
          gpu.tensorOpsMode == 4);
     BOOL splitRows = rows > 2048 &&
-        (autoSplitRows || (splitRowsValue && *splitRowsValue));
+        (forceSplitRows || autoSplitRows ||
+         (splitRowsValue && *splitRowsValue));
     BOOL specializedRows = rows <= 2048 || splitRows;
     BOOL naxShape = gpu.tensorOpsMode == 1 ||
         (specializedRows && gpu.tensorOpsMode == 2 &&
@@ -3333,7 +3352,9 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             return 0;
         }
         uint32_t splitAt = splitRows ? 2048 : rows;
-        if (splitRows) {
+        if (forceSplitRows) {
+            splitAt = forced_split_rows;
+        } else if (splitRows) {
             unsigned long requested = splitRowsValue ?
                 strtoul(splitRowsValue, NULL, 10) : 0;
             if (requested >= 128 && requested <= 2048)
@@ -3403,6 +3424,26 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_linear_bf16_impl(
+        opaque, output, input, weight, bias, rows, input_dim, output_dim, 0);
+}
+
+int h3_gpu_linear_bf16_split_rows(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim,
+                       uint32_t split_rows) {
+    return h3_gpu_linear_bf16_impl(
+        opaque, output, input, weight, bias, rows, input_dim, output_dim,
+        split_rows);
 }
 
 static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,

@@ -2398,10 +2398,16 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
         dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
         inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
         "VDN linear epilogue");
-    VDN_OP(h3_gpu_linear_bf16(
-        dit->gpu, dit->vdn_projected, dit->vdn_feature,
-        weight->vdn.output, NULL, inner_rows, INNER, HIDDEN),
-        "VDN linear output projection");
+    if (getenv("H3_DISABLE_VDN_SPLIT_NAX"))
+        VDN_OP(h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_projected, dit->vdn_feature,
+            weight->vdn.output, NULL, inner_rows, INNER, HIDDEN),
+            "VDN linear output projection");
+    else
+        VDN_OP(h3_gpu_linear_bf16_split_rows(
+            dit->gpu, dit->vdn_projected, dit->vdn_feature,
+            weight->vdn.output, NULL, inner_rows, INNER, HIDDEN, 2048),
+            "VDN split-row linear output projection");
     VDN_OP(h3_gpu_vdn_add_projected_bf16(
         dit->gpu, dit->attention_output, inner_start,
         dit->vdn_projected, inner_rows, HIDDEN),
@@ -2507,6 +2513,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
                 dit->use_slower_uncached_int8_scales),
                "DiT int8 attention output");
+    } else if (dit->vdn && !getenv("H3_DISABLE_VDN_SPLIT_NAX")) {
+        OP(h3_gpu_linear_bf16_split_rows(
+            dit->gpu, dit->attention_output, dit->attention_heads,
+            weight->out, NULL, rows, INNER, HIDDEN, 2048),
+           "VDN split-row attention output");
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
