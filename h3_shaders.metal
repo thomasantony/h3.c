@@ -5348,6 +5348,103 @@ template [[host_name("h3_linear_int8_local_scales_nax_r128_add")]]
 kernel h3_linear_int8_local_scales_nax_r128_add_t
     h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, true>;
 
+/* Long VDN projections benefit from a 256-row tile: the row scales are
+ * loaded once for twice as many output rows, while the 16-SIMD-group layout
+ * matches the existing wide FC2 TensorOps kernels. */
+template<uint INPUT_DIM, uint OUTPUT_DIM, bool ADD_RESIDUAL>
+kernel void h3_linear_int8_local_scales_nax_r256_impl(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           device const ushort *bias [[buffer(6)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint ROW_TILE = 256;
+    constexpr uint COLUMN_TILE = 128;
+    constexpr uint K_TILE = 128;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint output_dim = OUTPUT_DIM ? OUTPUT_DIM : args.output_dim;
+    uint column_tiles = output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
+    threadgroup float local_input_scales[ROW_TILE];
+    threadgroup float local_weight_scales[COLUMN_TILE];
+    if (tid < ROW_TILE)
+        local_input_scales[tid] = input_scales[row_start + tid];
+    if (tid < COLUMN_TILE)
+        local_weight_scales[tid] = weight_scales[column_start + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)input_dim, (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)input_dim, (int)output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto first_descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<descriptor, execution_simdgroups<16>> mm;
+    matmul2d<first_descriptor, execution_simdgroups<16>> first_mm;
+    auto first_a = x.slice<ROW_TILE, K_TILE>(0, (int)row_start);
+    auto first_b = w.slice<K_TILE, COLUMN_TILE>(0, (int)column_start);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    first_mm.run(first_a, first_b, accum);
+    if (INPUT_DIM) {
+        for (uint k = K_TILE; k < INPUT_DIM; k += K_TILE) {
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+    } else {
+        for (uint k = K_TILE; k < input_dim; k += K_TILE) {
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = column_start + (uint)index[0];
+        if (row < args.rows) {
+            float value = (float)accum[element] *
+                          local_input_scales[(uint)index[1]] *
+                          local_weight_scales[(uint)index[0]];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            if (ADD_RESIDUAL)
+                value += (float)output[row * output_dim + column];
+            output[row * output_dim + column] = (bfloat)value;
+        }
+    }
+}
+
+typedef decltype(h3_linear_int8_local_scales_nax_r256_impl<7168, 5376, false>)
+    h3_linear_int8_local_scales_nax_r256_t;
+template [[host_name("h3_linear_int8_local_scales_nax_r256_k7168")]]
+kernel h3_linear_int8_local_scales_nax_r256_t
+    h3_linear_int8_local_scales_nax_r256_impl<7168, 5376, false>;
+template [[host_name("h3_linear_int8_local_scales_nax_r256_k5376_o128")]]
+kernel h3_linear_int8_local_scales_nax_r256_t
+    h3_linear_int8_local_scales_nax_r256_impl<5376, 128, false>;
+template [[host_name("h3_linear_int8_local_scales_nax_r256_k128_o7168")]]
+kernel h3_linear_int8_local_scales_nax_r256_t
+    h3_linear_int8_local_scales_nax_r256_impl<128, 7168, false>;
+typedef decltype(h3_linear_int8_local_scales_nax_r256_impl<7168, 5376, true>)
+    h3_linear_int8_local_scales_nax_r256_add_t;
+template [[host_name("h3_linear_int8_local_scales_nax_r256_add")]]
+kernel h3_linear_int8_local_scales_nax_r256_add_t
+    h3_linear_int8_local_scales_nax_r256_impl<7168, 5376, true>;
+
 /* FC2 is more sensitive to a single scale spanning all 14336 activated
  * channels.  Retain one activation scale per 1024-wide K group, accumulate
  * each group's exact int32 product separately, then apply its scale before

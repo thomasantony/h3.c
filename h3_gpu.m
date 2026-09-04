@@ -576,6 +576,10 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k5376_o128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k128_o7168"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_add"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r256_k7168"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r256_k5376_o128"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r256_k128_o7168"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r256_add"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
@@ -5679,14 +5683,34 @@ static int h3_gpu_linear_int8_bf16_layout(
         output_dim == 128 && getenv("H3_VDN_LINEAR_KNOWN");
     BOOL known_vdn_up = local_scales && input_dim == 128 &&
         output_dim == 7168 && getenv("H3_VDN_LINEAR_KNOWN");
-    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, add_residual ? @"h3_linear_int8_local_scales_nax_r128_add" :
-             known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
-             known_vdn_down ? @"h3_linear_int8_local_scales_nax_r128_k5376_o128" :
-             known_vdn_up ? @"h3_linear_int8_local_scales_nax_r128_k128_o7168" :
-             local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
-                            @"h3_linear_int8_nax_r128");
-    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+    BOOL row256 = getenv("H3_INT8_LINEAR_ROW256") && rows >= 256 &&
+        (add_residual || known_linear || known_vdn_down || known_vdn_up);
+    NSString *pipeline_name = row256 ?
+        (add_residual ? @"h3_linear_int8_local_scales_nax_r256_add" :
+         known_linear ? @"h3_linear_int8_local_scales_nax_r256_k7168" :
+         known_vdn_down ? @"h3_linear_int8_local_scales_nax_r256_k5376_o128" :
+         known_vdn_up ? @"h3_linear_int8_local_scales_nax_r256_k128_o7168" :
+         @"h3_linear_int8_local_scales_nax_r128") :
+        (add_residual ? @"h3_linear_int8_local_scales_nax_r128_add" :
+         known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+         known_vdn_down ? @"h3_linear_int8_local_scales_nax_r128_k5376_o128" :
+         known_vdn_up ? @"h3_linear_int8_local_scales_nax_r128_k128_o7168" :
+         local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
+                        @"h3_linear_int8_nax_r128");
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+    NSUInteger threads = row256 ? 512u : 256u;
+    if (row256 && (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 512)) {
+        row256 = NO;
+        pipeline_name = add_residual ? @"h3_linear_int8_local_scales_nax_r128_add" :
+            known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+            known_vdn_down ? @"h3_linear_int8_local_scales_nax_r128_k5376_o128" :
+            known_vdn_up ? @"h3_linear_int8_local_scales_nax_r128_k128_o7168" :
+            local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
+                           @"h3_linear_int8_nax_r128";
+        pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+        threads = 256u;
+    }
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < threads) {
         h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");
         return 0;
     }
@@ -5708,10 +5732,11 @@ static int h3_gpu_linear_int8_bf16_layout(
                      offset:output_offset * sizeof(uint16_t) atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
-        NSUInteger groups = (NSUInteger)(padded_rows / 128u) *
+        uint32_t row_tile = row256 ? 256u : 128u;
+        NSUInteger groups = (NSUInteger)(padded_rows / row_tile) *
                             (output_dim / 128u);
         [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
