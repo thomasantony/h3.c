@@ -866,7 +866,8 @@ int h3_gpu_vdn_solve_f32_fp16_scan(
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
 /* Variant that also seeds PREFIX/SUFFIX's compact FP16 banks in the solve
  * pack, allowing h3_gpu_vdn_scan_fp16_prepacked_initialized() to skip its
- * two initialization blits. */
+ * two initialization blits.  The FP32 transition/injection outputs are not
+ * needed by that prepacked scan and may be left unspecified. */
 int h3_gpu_vdn_solve_f32_fp16_scan_to_buffers(
                      h3_gpu *gpu, h3_gpu_tensor *a_factor,
                      h3_gpu_tensor *injection,

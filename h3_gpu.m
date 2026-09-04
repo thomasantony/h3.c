@@ -1073,7 +1073,7 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
-typedef struct { uint32_t batches, dim, fp16_scan, seed_scan; }
+typedef struct { uint32_t batches, dim, fp16_scan, seed_scan, compact_only; }
     vdn_solve_pack_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
@@ -3171,7 +3171,8 @@ int h3_gpu_vdn_statistics_fp16(
  * products.  When the following scan uses FP16 storage, convert those two
  * banks here while they are already resident in the cooperative output pass.
  * It can also seed PREFIX/SUFFIX's injection banks, avoiding two follow-up
- * blit copies before the bidirectional scan. */
+ * blit copies before the bidirectional scan.  The compact-only form omits the
+ * dead FP32 transition/injection stores entirely. */
 static int h3_gpu_vdn_pack_solve_f32(
                      H3GPU *gpu, h3_gpu_tensor *injection,
                      h3_gpu_tensor *solution,
@@ -3180,10 +3181,11 @@ static int h3_gpu_vdn_pack_solve_f32(
                      h3_gpu_tensor *scan_prefix,
                      h3_gpu_tensor *scan_suffix,
                      uint32_t batches, uint32_t matrices, uint32_t dim,
-                     int vec4) {
+                     int vec4, int compact_only) {
     vdn_solve_pack_args args = {
         batches, dim, scan_workspace ? 1u : 0u,
-        scan_prefix && scan_suffix ? 1u : 0u
+        scan_prefix && scan_suffix ? 1u : 0u,
+        compact_only ? 1u : 0u
     };
     NSString *name = vec4 ? @"h3_vdn_pack_solve_f32_vec4" :
                             @"h3_vdn_pack_solve_f32";
@@ -3294,7 +3296,9 @@ static int h3_gpu_vdn_solve_f32_impl(
         return h3_gpu_vdn_pack_solve_f32(
             gpu, injection, solution, alpha, scan_workspace,
             scan_prefix, scan_suffix,
-            (uint32_t)batches, (uint32_t)matrices, dim, vec4);
+            (uint32_t)batches, (uint32_t)matrices, dim, vec4,
+            scan_workspace && scan_prefix && scan_suffix &&
+                !getenv("H3_DISABLE_VDN_FP16_COMPACT_ONLY"));
     }
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, @"h3_vdn_cholesky_solve_f32");
@@ -3353,7 +3357,9 @@ static int h3_gpu_vdn_solve_f32_impl(
     return h3_gpu_vdn_pack_solve_f32(
         gpu, injection, solution, alpha, scan_workspace,
         scan_prefix, scan_suffix,
-        (uint32_t)batches, (uint32_t)matrices, dim, vec4);
+        (uint32_t)batches, (uint32_t)matrices, dim, vec4,
+        scan_workspace && scan_prefix && scan_suffix &&
+            !getenv("H3_DISABLE_VDN_FP16_COMPACT_ONLY"));
 }
 
 int h3_gpu_vdn_solve_f32(

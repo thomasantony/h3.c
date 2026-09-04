@@ -1800,7 +1800,7 @@ kernel void h3_vdn_alpha_vec4_f32(
 
 struct vdn_solve_args { uint batches; uint dim; };
 struct vdn_solve_pack_args {
-    uint batches; uint dim; uint fp16_scan; uint seed_scan;
+    uint batches; uint dim; uint fp16_scan; uint seed_scan; uint compact_only;
 };
 /* Prepare the SPD matrices and identity right-hand sides for the optional
  * MPS Cholesky backend.  The existing fused kernel retains the hand-written
@@ -1905,8 +1905,10 @@ kernel void h3_vdn_pack_solve_f32(
     float transition_value = solved[right + element] *
                              alpha[batch * args.dim + row];
     float injection_value = solved[bank_size + right + element];
-    transition[index] = transition_value;
-    injection[index] = injection_value;
+    if (!args.compact_only) {
+        transition[index] = transition_value;
+        injection[index] = injection_value;
+    }
     if (args.fp16_scan) {
         uint half_bank_size = bank_size;
         scan_workspace[index] = half(transition_value);
@@ -1940,8 +1942,10 @@ kernel void h3_vdn_pack_solve_f32_vec4(
     float scale = alpha[matrix * args.dim + row];
     float4 transition_value = solved[index] * scale;
     float4 injection_value = solved[bank_size + index];
-    transition[index] = transition_value;
-    injection[index] = injection_value;
+    if (!args.compact_only) {
+        transition[index] = transition_value;
+        injection[index] = injection_value;
+    }
     if (args.fp16_scan) {
         uint half_bank_size = bank_size;
         scan_workspace[index] = half4(transition_value);
