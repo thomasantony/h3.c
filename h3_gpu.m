@@ -5372,13 +5372,17 @@ static int h3_gpu_quantize_bf16_int8_groups(
     if (cache_override)
         cached128 = cached128 && *cache_override &&
             strcmp(cache_override, "0");
-    NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
+    BOOL vector_quantizer = getenv("H3_INT8_VECTOR_QUANT") != NULL;
+    NSString *kernel = vector_quantizer ?
         @"h3_quantize_bf16_int8_groups" : cached128 ?
         @"h3_quantize_bf16_int8_groups_scalar128_cached" : scalar128 ?
         @"h3_quantize_bf16_int8_groups_scalar128" :
         @"h3_quantize_bf16_int8_groups_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
-    NSUInteger threads = scalar128 ? 128u : 256u;
+    /* The vector kernel and its eight-simdgroup reduction are written for
+     * 256 threads even when the scalar 128-thread specialization would be
+     * selected for short rows. */
+    NSUInteger threads = vector_quantizer ? 256u : scalar128 ? 128u : 256u;
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < threads) {
         h3_gpu_set_error(gpu,
                          @"device cannot dispatch grouped M5 int8 quantizer");
