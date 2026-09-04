@@ -481,7 +481,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_alpha_f32", @"h3_vdn_alpha_vec4_f32",
             @"h3_vdn_prepare_solve_f32",
             @"h3_vdn_cholesky_solve_f32",
-            @"h3_vdn_pack_solve_f32",
+            @"h3_vdn_pack_solve_f32", @"h3_vdn_pack_solve_f32_vec4",
             @"h3_vdn_pack_scan_fp16", @"h3_vdn_pack_scan_fp16_vec4",
             @"h3_vdn_pack_state_fp16", @"h3_vdn_pack_state_fp16_vec4",
             @"h3_vdn_scale_f32", @"h3_vdn_decay_f32",
@@ -493,7 +493,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_gather_state_fp16_decay_vec4",
             @"h3_vdn_gather_state_bf16_decay_vec4",
             @"h3_vdn_epilogue_bf16", @"h3_vdn_epilogue_vec4_bf16",
-            @"h3_vdn_add_projected_bf16",
+            @"h3_vdn_add_projected_bf16", @"h3_vdn_add_projected_vec4_bf16",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
             @"h3_linear_f32_tiled_bf16_map",
             @"h3_cast_f32_to_bf16",
@@ -3230,8 +3230,12 @@ int h3_gpu_vdn_solve_f32(
         h3_gpu_stats stats = gpu.stats;
         stats.direct_dispatches += 3;
         gpu.stats = stats;
-        return h3_gpu_dispatch_1d(gpu, @"h3_vdn_pack_solve_f32",
-                                  (uint32_t)matrices,
+        int vec4 = dim % 4 == 0 &&
+            !getenv("H3_DISABLE_VDN_SOLVE_VEC4");
+        NSString *pack_name = vec4 ? @"h3_vdn_pack_solve_f32_vec4" :
+                                     @"h3_vdn_pack_solve_f32";
+        uint32_t pack_count = (uint32_t)(vec4 ? matrices / 4 : matrices);
+        return h3_gpu_dispatch_1d(gpu, pack_name, pack_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:0];
                 [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:1];
@@ -3293,8 +3297,11 @@ int h3_gpu_vdn_solve_f32(
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches++;
     gpu.stats = stats;
-    return h3_gpu_dispatch_1d(gpu, @"h3_vdn_pack_solve_f32",
-                              (uint32_t)matrices,
+    int vec4 = dim % 4 == 0 && !getenv("H3_DISABLE_VDN_SOLVE_VEC4");
+    NSString *pack_name = vec4 ? @"h3_vdn_pack_solve_f32_vec4" :
+                                 @"h3_vdn_pack_solve_f32";
+    uint32_t pack_count = (uint32_t)(vec4 ? matrices / 4 : matrices);
+    return h3_gpu_dispatch_1d(gpu, pack_name, pack_count,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:1];
@@ -3896,8 +3903,12 @@ int h3_gpu_vdn_add_projected_bf16(
         !h3_gpu_require_bf16(gpu, source, count, @"VDN add source")) return 0;
     typedef struct { uint32_t destination_row, rows, width; } args_type;
     args_type args = {destination_row, rows, width};
-    return h3_gpu_dispatch_1d(gpu, @"h3_vdn_add_projected_bf16",
-        (uint32_t)count, ^(id<MTLComputeCommandEncoder> encoder) {
+    int vec4 = width % 4 == 0;
+    NSString *name = vec4 ? @"h3_vdn_add_projected_vec4_bf16" :
+                            @"h3_vdn_add_projected_bf16";
+    uint32_t dispatch_count = (uint32_t)(vec4 ? count / 4 : count);
+    return h3_gpu_dispatch_1d(gpu, name, dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(destination).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(source).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];

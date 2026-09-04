@@ -1847,6 +1847,27 @@ kernel void h3_vdn_pack_solve_f32(
     injection[index] = solved[bank_size + right + element];
 }
 
+kernel void h3_vdn_pack_solve_f32_vec4(
+                                device const float4 *solved [[buffer(0)]],
+                                device float4 *injection [[buffer(1)]],
+                                device float4 *transition [[buffer(2)]],
+                                device const float *alpha [[buffer(3)]],
+                                constant vdn_solve_args &args [[buffer(4)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint vectors_per_matrix = matrix_size / 4u;
+    uint count = args.batches * vectors_per_matrix;
+    if (index >= count) return;
+    uint matrix = index / vectors_per_matrix;
+    uint vector = index - matrix * vectors_per_matrix;
+    uint element = vector * 4u;
+    uint row = element / args.dim;
+    uint bank_size = args.batches * vectors_per_matrix;
+    float scale = alpha[matrix * args.dim + row];
+    transition[index] = solved[index] * scale;
+    injection[index] = solved[bank_size + index];
+}
+
 struct vdn_scale_args { uint elements; float scale; };
 kernel void h3_vdn_scale_f32(device const float *input [[buffer(0)]],
                              device float *output [[buffer(1)]],
@@ -2368,6 +2389,19 @@ kernel void h3_vdn_add_projected_bf16(
     uint target = args.destination_row * args.width + index;
     destination[target] = h3_f32_to_bf16(
         h3_bf16_to_f32(destination[target]) + h3_bf16_to_f32(source[index]));
+}
+
+kernel void h3_vdn_add_projected_vec4_bf16(
+                                device ushort4 *destination [[buffer(0)]],
+                                device const ushort4 *source [[buffer(1)]],
+                                constant vdn_add_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.rows * args.width / 4u;
+    if (index >= vectors) return;
+    uint target = args.destination_row * (args.width / 4u) + index;
+    destination[target] = h3_f32x4_to_bf16(
+        h3_bf16x4_to_f32(destination[target]) +
+        h3_bf16x4_to_f32(source[index]));
 }
 
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
