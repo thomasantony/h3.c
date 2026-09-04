@@ -2650,6 +2650,9 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
     int fused_kv_conv = getenv("H3_VDN_FUSED_KV_CONV") != NULL;
     int fused_query_feature = fused_kv_conv &&
         getenv("H3_VDN_FUSED_QUERY_FEATURE") != NULL;
+    int fused_stats = fused_query_feature &&
+        getenv("H3_VDN_FP16_STATS") != NULL &&
+        getenv("H3_VDN_FP16_STATS_FUSED") != NULL;
     /* The fused query kernel still reads the raw grouped QKV stream while it
      * writes the temporal K/V features.  Keep that source immutable by using
      * the attention-head scratch tensor for V when the fused query path is
@@ -2667,15 +2670,16 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             weight->vdn.k_spatial, weight->vdn.v_spatial,
             inner_start, inner_frames, grid_h, grid_w, HEADS, HEAD_DIM),
             "VDN fused K/V spatial convolution");
-        if (fused_query_feature)
-            VDN_OP(h3_gpu_vdn_temporal_feature_bf16_pair_query(
-                dit->gpu, dit->vdn_feature, vdn_value_feature, dit->query,
-                dit->qkv,
-                dit->key, dit->value,
-                weight->vdn.k_temporal, weight->vdn.v_temporal,
-                inner_start, inner_frames, frame_rows, HEADS, HEAD_DIM),
-                "VDN fused K/V temporal convolution and query features");
-        else
+        if (fused_query_feature) {
+            if (!fused_stats)
+                VDN_OP(h3_gpu_vdn_temporal_feature_bf16_pair_query(
+                    dit->gpu, dit->vdn_feature, vdn_value_feature, dit->query,
+                    dit->qkv,
+                    dit->key, dit->value,
+                    weight->vdn.k_temporal, weight->vdn.v_temporal,
+                    inner_start, inner_frames, frame_rows, HEADS, HEAD_DIM),
+                    "VDN fused K/V temporal convolution and query features");
+        } else
             VDN_OP(h3_gpu_vdn_temporal_feature_bf16_pair(
                 dit->gpu, dit->vdn_feature, vdn_value_feature,
                 dit->key, dit->value,
@@ -2717,7 +2721,19 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             direct_video_input ? dit->mod_attention : dit->vdn_video_hidden,
             weight->vdn.beta, NULL, inner_rows, HIDDEN, HEADS),
         "VDN video beta");
+    if (fused_stats)
+        VDN_OP(h3_gpu_vdn_temporal_feature_pair_query_stats_fp16(
+            dit->gpu, dit->vdn_rhs, dit->vdn_solution, vdn_value_feature,
+            dit->query, dit->qkv, dit->key, dit->value,
+            weight->vdn.k_temporal, weight->vdn.v_temporal,
+            dit->vdn_softmax_gate, inner_start, inner_frames, frame_rows,
+            HEADS, HEAD_DIM), "VDN fused temporal FP16 statistics packing");
     VDN_OP(getenv("H3_VDN_FP16_STATS") ?
+        fused_stats ?
+        h3_gpu_vdn_statistics_fp16_packed(
+            dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
+            dit->vdn_solution, vdn_value_feature, dit->vdn_prefix,
+            inner_frames, frame_rows, HEADS, HEAD_DIM) :
         h3_gpu_vdn_statistics_fp16(
             dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_feature,
             vdn_value_feature,

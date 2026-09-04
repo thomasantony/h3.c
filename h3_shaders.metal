@@ -1471,6 +1471,144 @@ kernel void h3_vdn_temporal_feature_pair_query_vec4_bf16(
     }
 }
 
+/* Fused temporal-feature/statistics preparation for the FP16 VDN path.
+ *
+ * The ordinary path writes BF16 temporal K/V features and a BF16 query,
+ * followed by two global-memory packing passes that transpose the features,
+ * apply the beta sigmoid, and convert them to FP16 for the batched MPS
+ * products.  The fixed H3 shape (head_dim=128) can do all of that while each
+ * row/head pair is resident in one thread.  Key and query retain the same
+ * BF16 rounding boundaries as h3_vdn_temporal_feature_pair_query_vec4_bf16;
+ * only the final storage is written directly in the head-major FP16 layout.
+ * The three packed destinations intentionally have raw 16-bit storage and
+ * may be backed by tensors whose public dtype is BF16/F32. */
+kernel void h3_vdn_temporal_feature_pair_query_stats_fp16_vec4(
+                                device const ushort *qkv [[buffer(0)]],
+                                device const ushort *key_spatial [[buffer(1)]],
+                                device const ushort *value_spatial [[buffer(2)]],
+                                device const ushort *key_weight [[buffer(3)]],
+                                device const ushort *value_weight [[buffer(4)]],
+                                device const ushort *beta [[buffer(5)]],
+                                device half4 *packed_key [[buffer(6)]],
+                                device half4 *packed_scaled_key [[buffer(7)]],
+                                device half4 *packed_scaled_value [[buffer(8)]],
+                                device ushort4 *query_output [[buffer(9)]],
+                                constant vdn_feature_args &args [[buffer(10)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint VECTORS_PER_HEAD = 32;
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads || args.head_dim != 128) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint channel_base = head * args.head_dim;
+    uint packed_base = ((frame * args.heads + head) *
+                        args.tokens_per_frame + token) * args.head_dim;
+    uint query_base = packed_base;
+    device half4 *packed_key4 = packed_key + packed_base / 4;
+    device half4 *packed_scaled_key4 = packed_scaled_key + packed_base / 4;
+    device half4 *packed_scaled_value4 = packed_scaled_value + packed_base / 4;
+    device ushort4 *query_output4 = query_output + query_base / 4;
+
+    float gate = 1.0f / (1.0f + exp(-h3_bf16_to_f32(
+        beta[(frame * args.tokens_per_frame + token) * args.heads + head])));
+    thread ushort4 key_features[VECTORS_PER_HEAD];
+    thread ushort4 query_features[VECTORS_PER_HEAD];
+    float key_sum_sq = 0.0f;
+    float query_sum_sq = 0.0f;
+    for (uint d = 0; d < args.head_dim; d += 4) {
+        uint channel = channel_base + d;
+        float4 key_sum = 0.0f;
+        float4 value_sum = 0.0f;
+        if (frame >= 2 && frame + 2 < args.frames) {
+            uint source_row = (frame - 2) * args.tokens_per_frame + token;
+            for (uint kt = 0; kt < 5; kt++) {
+                uint source = ((source_row + kt * args.tokens_per_frame) *
+                               args.heads + head) * args.head_dim + d;
+                float4 key_value = h3_bf16x4_to_f32(
+                    *reinterpret_cast<device const ushort4 *>(key_spatial + source));
+                float4 value_value = h3_bf16x4_to_f32(
+                    *reinterpret_cast<device const ushort4 *>(value_spatial + source));
+                ushort4 key_bits = ushort4(
+                    key_weight[(channel + 0) * 5 + kt],
+                    key_weight[(channel + 1) * 5 + kt],
+                    key_weight[(channel + 2) * 5 + kt],
+                    key_weight[(channel + 3) * 5 + kt]);
+                ushort4 value_bits = ushort4(
+                    value_weight[(channel + 0) * 5 + kt],
+                    value_weight[(channel + 1) * 5 + kt],
+                    value_weight[(channel + 2) * 5 + kt],
+                    value_weight[(channel + 3) * 5 + kt]);
+                key_sum = fma(key_value, h3_bf16x4_to_f32(key_bits), key_sum);
+                value_sum = fma(value_value,
+                                 h3_bf16x4_to_f32(value_bits), value_sum);
+            }
+        } else for (int kt = -2; kt <= 2; kt++) {
+            int sf = int(frame) + kt;
+            if (sf < 0 || sf >= int(args.frames)) continue;
+            uint source_row = uint(sf) * args.tokens_per_frame + token;
+            uint source = (source_row * args.heads + head) * args.head_dim + d;
+            uint tap = uint(kt + 2);
+            float4 key_value = h3_bf16x4_to_f32(
+                *reinterpret_cast<device const ushort4 *>(key_spatial + source));
+            float4 value_value = h3_bf16x4_to_f32(
+                *reinterpret_cast<device const ushort4 *>(value_spatial + source));
+            ushort4 key_bits = ushort4(
+                key_weight[(channel + 0) * 5 + tap],
+                key_weight[(channel + 1) * 5 + tap],
+                key_weight[(channel + 2) * 5 + tap],
+                key_weight[(channel + 3) * 5 + tap]);
+            ushort4 value_bits = ushort4(
+                value_weight[(channel + 0) * 5 + tap],
+                value_weight[(channel + 1) * 5 + tap],
+                value_weight[(channel + 2) * 5 + tap],
+                value_weight[(channel + 3) * 5 + tap]);
+            key_sum = fma(key_value, h3_bf16x4_to_f32(key_bits), key_sum);
+            value_sum = fma(value_value,
+                             h3_bf16x4_to_f32(value_bits), value_sum);
+        }
+        float4 key_activated = key_sum / (1.0f + exp(-key_sum));
+        float4 value_activated = value_sum / (1.0f + exp(-value_sum));
+        ushort4 key_feature = h3_f32x4_to_bf16(key_activated);
+        ushort4 value_feature = h3_f32x4_to_bf16(value_activated);
+        key_features[d / 4] = key_feature;
+        float4 key_rounded = h3_bf16x4_to_f32(key_feature);
+        key_sum_sq = fma(key_rounded.x, key_rounded.x, key_sum_sq);
+        key_sum_sq = fma(key_rounded.y, key_rounded.y, key_sum_sq);
+        key_sum_sq = fma(key_rounded.z, key_rounded.z, key_sum_sq);
+        key_sum_sq = fma(key_rounded.w, key_rounded.w, key_sum_sq);
+        packed_scaled_value4[d / 4] = half4(
+            h3_bf16x4_to_f32(value_feature) * gate);
+
+        uint q_source = h3_vdn_grouped_index(
+            args.source_row + row, head, 0, d, args.heads, args.head_dim);
+        float4 query_value = h3_bf16x4_to_f32(
+            *reinterpret_cast<device const ushort4 *>(qkv + q_source));
+        ushort4 query_feature = h3_f32x4_to_bf16(
+            query_value / (1.0f + exp(-query_value)));
+        query_features[d / 4] = query_feature;
+        float4 query_rounded = h3_bf16x4_to_f32(query_feature);
+        query_sum_sq = fma(query_rounded.x, query_rounded.x, query_sum_sq);
+        query_sum_sq = fma(query_rounded.y, query_rounded.y, query_sum_sq);
+        query_sum_sq = fma(query_rounded.z, query_rounded.z, query_sum_sq);
+        query_sum_sq = fma(query_rounded.w, query_rounded.w, query_sum_sq);
+    }
+    float key_inverse = rsqrt(max(key_sum_sq, 1.0e-24f));
+    float query_inverse = rsqrt(max(query_sum_sq, 1.0e-24f));
+    for (uint vector = 0; vector < VECTORS_PER_HEAD; vector++) {
+        float4 key_rounded = h3_bf16x4_to_f32(key_features[vector]);
+        ushort4 normalized_key = h3_f32x4_to_bf16(
+            key_rounded * key_inverse);
+        packed_key4[vector] = half4(h3_bf16x4_to_f32(normalized_key));
+        packed_scaled_key4[vector] = half4(
+            h3_bf16x4_to_f32(normalized_key) * gate);
+        float4 query_rounded = h3_bf16x4_to_f32(query_features[vector]);
+        query_output4[vector] = h3_f32x4_to_bf16(
+            query_rounded * query_inverse);
+    }
+}
+
 struct vdn_stats_pack_args {
     uint frames; uint tokens; uint heads; uint dim; uint value_pass;
     uint reuse_gate;

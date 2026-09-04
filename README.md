@@ -156,6 +156,7 @@ H3_VDN_FUSED_INT8_QKV=1 H3_VDN_FUSED_INT8_QKV_INPUT=1 \
 H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
 H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
+H3_VDN_FP16_STATS_FUSED=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
 H3_VDN_TENSOR_READOUT=1 H3_VDN_TENSOR_READOUT_128=1 \
 H3_VDN_TENSOR_READOUT_256=1 \
@@ -177,6 +178,10 @@ so the following VDN beta projections can still reuse their QKV quantization).
 `H3_VDN_FUSED_QUERY_FEATURE` folds the raw-Q SiLU/L2 pass into the fused temporal
 K/V convolution; it is selected only with `H3_VDN_FUSED_KV_CONV` and retains the
 old standalone kernel as the default fallback.
+`H3_VDN_FP16_STATS_FUSED=1` additionally folds temporal K/V production, raw-Q
+feature normalization, beta gating, and BF16-to-FP16 statistics packing into
+one fixed-shape launch. It is selected only with `H3_VDN_FP16_STATS=1` and the
+two fused convolution flags; the existing multi-pass path remains the fallback.
 `H3_VDN_TENSOR_LINEAR` routes the F32-by-BF16 VDN alpha projections through
 Metal 4 TensorOps; the existing vectorized GEMV remains the fallback.
 `H3_VDN_TENSOR_READOUT` routes the per-frame/head VDN state readout through a

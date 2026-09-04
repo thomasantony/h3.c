@@ -470,6 +470,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_temporal_feature_pair_vec4_bf16",
             @"h3_vdn_temporal_feature_pair_query_bf16",
             @"h3_vdn_temporal_feature_pair_query_vec4_bf16",
+            @"h3_vdn_temporal_feature_pair_query_stats_fp16_vec4",
             @"h3_vdn_pack_stats_fp16",
             @"h3_vdn_pack_stats_fp16_gate_cached",
             @"h3_vdn_cast_stats_fp16_f32",
@@ -2658,6 +2659,75 @@ int h3_gpu_vdn_temporal_feature_bf16_pair_query(
         });
 }
 
+int h3_gpu_vdn_temporal_feature_pair_query_stats_fp16(
+                     h3_gpu *opaque, h3_gpu_tensor *packed_key,
+                     h3_gpu_tensor *packed_scaled_key,
+                     h3_gpu_tensor *packed_scaled_value,
+                     h3_gpu_tensor *query_feature,
+                     const h3_gpu_tensor *grouped_qkv,
+                     const h3_gpu_tensor *key_spatial,
+                     const h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight,
+                     const h3_gpu_tensor *beta_logits, uint32_t source_row,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * tokens_per_frame;
+    size_t features = rows * heads * head_dim;
+    if (rows > UINT32_MAX || source_row > UINT32_MAX - (uint32_t)rows ||
+        features > SIZE_MAX / sizeof(uint16_t)) return 0;
+    size_t qkv_rows = (size_t)source_row + rows;
+    size_t qkv_width = (size_t)heads * head_dim * 3;
+    if (!qkv_width || qkv_rows > SIZE_MAX / qkv_width)
+        return 0;
+    size_t qkv_count = qkv_rows * qkv_width;
+    size_t packed_bytes = features * sizeof(uint16_t);
+    if (!frames || !tokens_per_frame || !heads || head_dim != 128 ||
+        head_dim % 4 || features / 4 > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, grouped_qkv, qkv_count,
+                             @"VDN fused FP16 grouped QKV") ||
+        !h3_gpu_require_bf16(gpu, key_spatial, features,
+                             @"VDN fused FP16 K spatial input") ||
+        !h3_gpu_require_bf16(gpu, value_spatial, features,
+                             @"VDN fused FP16 V spatial input") ||
+        !h3_gpu_require_bf16(gpu, key_weight,
+                             (size_t)heads * head_dim * 5,
+                             @"VDN fused FP16 K temporal weight") ||
+        !h3_gpu_require_bf16(gpu, value_weight,
+                             (size_t)heads * head_dim * 5,
+                             @"VDN fused FP16 V temporal weight") ||
+        !h3_gpu_require_bf16(gpu, beta_logits, rows * heads,
+                             @"VDN fused FP16 beta logits") ||
+        !h3_gpu_require_bf16(gpu, query_feature, features,
+                             @"VDN fused FP16 query output") ||
+        !packed_key || !packed_scaled_key || !packed_scaled_value ||
+        TENSOR(packed_key).bytes < packed_bytes ||
+        TENSOR(packed_scaled_key).bytes < packed_bytes ||
+        TENSOR(packed_scaled_value).bytes < packed_bytes ||
+        !h3_gpu_require_command(gpu)) return 0;
+    h3_vdn_feature_args args = {
+        source_row, frames, tokens_per_frame, 0, 0,
+        heads, head_dim, 0, 1
+    };
+    return h3_gpu_dispatch_2d(gpu,
+        @"h3_vdn_temporal_feature_pair_query_stats_fp16_vec4",
+        (uint32_t)rows, heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key_spatial).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(value_spatial).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(key_weight).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(value_weight).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(beta_logits).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(packed_key).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(packed_scaled_key).buffer offset:0 atIndex:7];
+            [encoder setBuffer:TENSOR(packed_scaled_value).buffer offset:0 atIndex:8];
+            [encoder setBuffer:TENSOR(query_feature).buffer offset:0 atIndex:9];
+            [encoder setBytes:&args length:sizeof(args) atIndex:10];
+        });
+}
+
 int h3_gpu_vdn_frame_mean_f32_offset(
                      h3_gpu *opaque, h3_gpu_tensor *mean,
                      const h3_gpu_tensor *input, size_t input_offset,
@@ -3173,6 +3243,109 @@ int h3_gpu_vdn_statistics_fp16(
         multiply.batchSize = batches;
         [multiply encodeToCommandBuffer:gpu.command leftMatrix:scaledMatrix
                 rightMatrix:keyMatrix resultMatrix:productMatrix];
+    }
+    cast_args.symmetric = 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_vdn_cast_stats_fp16_f32",
+            (uint32_t)matrices,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(product).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(b).buffer offset:0 atIndex:1];
+            [encoder setBytes:&cast_args length:sizeof(cast_args) atIndex:2];
+        });
+}
+
+int h3_gpu_vdn_statistics_fp16_packed(
+                     h3_gpu *opaque, h3_gpu_tensor *a, h3_gpu_tensor *b,
+                     const h3_gpu_tensor *packed_key,
+                     const h3_gpu_tensor *packed_scaled_key,
+                     const h3_gpu_tensor *packed_scaled_value,
+                     h3_gpu_tensor *product, uint32_t frames,
+                     uint32_t tokens, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t batches = (size_t)frames * heads;
+    size_t features = batches * tokens * dim;
+    size_t matrices = batches * dim * dim;
+    size_t packed_bytes = features * sizeof(uint16_t);
+    if (!frames || !tokens || !heads || !dim || dim % 4 ||
+        features > SIZE_MAX / sizeof(uint16_t) ||
+        features / 4 > UINT32_MAX || matrices > UINT32_MAX ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_f32(gpu, a, matrices, @"VDN packed A statistics") ||
+        !h3_gpu_require_f32(gpu, b, matrices, @"VDN packed B statistics") ||
+        !a || !b || !packed_key || !packed_scaled_key ||
+        !packed_scaled_value || !product ||
+        TENSOR(packed_key).bytes < packed_bytes ||
+        TENSOR(packed_scaled_key).bytes < packed_bytes ||
+        TENSOR(packed_scaled_value).bytes < packed_bytes ||
+        TENSOR(product).bytes < matrices * sizeof(uint16_t)) return 0;
+    NSUInteger feature_row_bytes = (NSUInteger)dim * sizeof(uint16_t);
+    NSUInteger feature_matrix_bytes = (NSUInteger)tokens * feature_row_bytes;
+    NSUInteger product_row_bytes = (NSUInteger)dim * sizeof(uint16_t);
+    NSUInteger product_matrix_bytes = (NSUInteger)dim * product_row_bytes;
+    @autoreleasepool {
+        MPSMatrixDescriptor *feature_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:tokens columns:dim matrices:batches
+            rowBytes:feature_row_bytes matrixBytes:feature_matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *product_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:dim matrices:batches
+            rowBytes:product_row_bytes matrixBytes:product_matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrix *key_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(packed_key).buffer offset:0
+            descriptor:feature_descriptor];
+        MPSMatrix *scaled_key_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(packed_scaled_key).buffer offset:0
+            descriptor:feature_descriptor];
+        MPSMatrix *product_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(product).buffer offset:0
+            descriptor:product_descriptor];
+        MPSMatrixMultiplication *multiply = [[MPSMatrixMultiplication alloc]
+            initWithDevice:gpu.device transposeLeft:YES transposeRight:NO
+            resultRows:dim resultColumns:dim interiorColumns:tokens
+            alpha:1.0 beta:0.0];
+        multiply.batchSize = batches;
+        [multiply encodeToCommandBuffer:gpu.command
+                            leftMatrix:scaled_key_matrix
+                           rightMatrix:key_matrix
+                          resultMatrix:product_matrix];
+    }
+    typedef struct { uint32_t batches, dim, symmetric; } cast_args_type;
+    cast_args_type cast_args = {(uint32_t)batches, dim, 1};
+    if (!h3_gpu_dispatch_1d(gpu, @"h3_vdn_cast_stats_fp16_f32",
+            (uint32_t)matrices,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(product).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(a).buffer offset:0 atIndex:1];
+                [encoder setBytes:&cast_args length:sizeof(cast_args) atIndex:2];
+            })) return 0;
+    @autoreleasepool {
+        MPSMatrixDescriptor *feature_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:tokens columns:dim matrices:batches
+            rowBytes:feature_row_bytes matrixBytes:feature_matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *product_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:dim matrices:batches
+            rowBytes:product_row_bytes matrixBytes:product_matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrix *key_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(packed_key).buffer offset:0
+            descriptor:feature_descriptor];
+        MPSMatrix *scaled_value_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(packed_scaled_value).buffer offset:0
+            descriptor:feature_descriptor];
+        MPSMatrix *product_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(product).buffer offset:0
+            descriptor:product_descriptor];
+        MPSMatrixMultiplication *multiply = [[MPSMatrixMultiplication alloc]
+            initWithDevice:gpu.device transposeLeft:YES transposeRight:NO
+            resultRows:dim resultColumns:dim interiorColumns:tokens
+            alpha:1.0 beta:0.0];
+        multiply.batchSize = batches;
+        [multiply encodeToCommandBuffer:gpu.command
+                            leftMatrix:scaled_value_matrix
+                           rightMatrix:key_matrix
+                          resultMatrix:product_matrix];
     }
     cast_args.symmetric = 0;
     return h3_gpu_dispatch_1d(gpu, @"h3_vdn_cast_stats_fp16_f32",

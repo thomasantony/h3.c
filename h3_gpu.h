@@ -799,6 +799,24 @@ int h3_gpu_vdn_temporal_feature_bf16_pair_query(
                      const h3_gpu_tensor *value_weight, uint32_t source_row,
                      uint32_t frames, uint32_t tokens_per_frame,
                      uint32_t heads, uint32_t head_dim);
+/* Fused FP16 statistics preparation for the fixed H3 VDN shape.  Temporal
+ * K/V and raw-Q features are computed once, then written directly into the
+ * batched head-major FP16 layouts consumed by the MPS products.  The packed
+ * destinations retain 16-bit storage but may be backed by BF16/F32 tensors
+ * whose public dtype is used elsewhere in the activation arena. */
+int h3_gpu_vdn_temporal_feature_pair_query_stats_fp16(
+                     h3_gpu *gpu, h3_gpu_tensor *packed_key,
+                     h3_gpu_tensor *packed_scaled_key,
+                     h3_gpu_tensor *packed_scaled_value,
+                     h3_gpu_tensor *query_feature,
+                     const h3_gpu_tensor *grouped_qkv,
+                     const h3_gpu_tensor *key_spatial,
+                     const h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight,
+                     const h3_gpu_tensor *beta_logits, uint32_t source_row,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_frame_mean_f32(
                      h3_gpu *gpu, h3_gpu_tensor *mean,
                      const h3_gpu_tensor *input, uint32_t frames,
@@ -858,6 +876,18 @@ int h3_gpu_vdn_statistics_fp16(
                      h3_gpu_tensor *product,
                      uint32_t frames, uint32_t tokens_per_frame,
                      uint32_t heads, uint32_t head_dim);
+/* Consume already-packed FP16 VDN statistics inputs.  This skips the two
+ * BF16->FP16 transpose/gate passes used by h3_gpu_vdn_statistics_fp16; the
+ * packed tensors are validated by byte capacity because their storage can be
+ * borrowed from BF16/F32 scratch buffers. */
+int h3_gpu_vdn_statistics_fp16_packed(
+                     h3_gpu *gpu, h3_gpu_tensor *a, h3_gpu_tensor *b,
+                     const h3_gpu_tensor *packed_key,
+                     const h3_gpu_tensor *packed_scaled_key,
+                     const h3_gpu_tensor *packed_scaled_value,
+                     h3_gpu_tensor *product, uint32_t frames,
+                     uint32_t tokens_per_frame, uint32_t heads,
+                     uint32_t head_dim);
 int h3_gpu_vdn_solve_f32(
                      h3_gpu *gpu, h3_gpu_tensor *a_factor,
                      h3_gpu_tensor *injection,
