@@ -175,8 +175,10 @@ Metal 4 TensorOps; the existing vectorized GEMV remains the fallback.
 direct Metal 4 TensorOps tile, avoiding the MPSGraph transpose/feed wrapper;
 the graph readout remains the fallback when the flag is unset.
 `H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
-reuses the solve RHS arena, reducing bandwidth and matrix-product cost; the
-default scan remains FP32 for numerical closeness.
+reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
+solve-pack pass emits those compact transition/injection banks directly, so
+the scan does not perform a second full-bank conversion; the default scan
+remains FP32 for numerical closeness.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 
