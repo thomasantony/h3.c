@@ -468,6 +468,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_temporal_feature_vec4_bf16",
             @"h3_vdn_temporal_feature_pair_bf16",
             @"h3_vdn_temporal_feature_pair_vec4_bf16",
+            @"h3_vdn_temporal_feature_pair_query_bf16",
+            @"h3_vdn_temporal_feature_pair_query_vec4_bf16",
             @"h3_vdn_pack_stats_fp16", @"h3_vdn_cast_stats_fp16_f32",
             @"h3_vdn_frame_mean_f32",
             @"h3_vdn_frame_mean_vec4_f32",
@@ -2567,6 +2569,65 @@ int h3_gpu_vdn_temporal_feature_bf16_pair(
             [encoder setBuffer:TENSOR(key_feature).buffer offset:0 atIndex:4];
             [encoder setBuffer:TENSOR(value_feature).buffer offset:0 atIndex:5];
             [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+int h3_gpu_vdn_temporal_feature_bf16_pair_query(
+                     h3_gpu *opaque, h3_gpu_tensor *key_feature,
+                     h3_gpu_tensor *value_feature, h3_gpu_tensor *query_feature,
+                     const h3_gpu_tensor *grouped_qkv,
+                     const h3_gpu_tensor *key_spatial,
+                     const h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight, uint32_t source_row,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * tokens_per_frame;
+    size_t count = rows * heads * head_dim;
+    if (rows > UINT32_MAX || source_row > UINT32_MAX - (uint32_t)rows)
+        return 0;
+    size_t qkv_rows = (size_t)source_row + rows;
+    size_t qkv_width = (size_t)heads * head_dim * 3;
+    if (!qkv_width || qkv_rows > SIZE_MAX / qkv_width)
+        return 0;
+    size_t qkv_count = qkv_rows * qkv_width;
+    if (!frames || !tokens_per_frame || !heads || !head_dim ||
+        !h3_gpu_require_bf16(gpu, grouped_qkv, qkv_count,
+                             @"VDN pair-query grouped QKV") ||
+        !h3_gpu_require_bf16(gpu, key_spatial, count,
+                             @"VDN pair-query K temporal input") ||
+        !h3_gpu_require_bf16(gpu, value_spatial, count,
+                             @"VDN pair-query V temporal input") ||
+        !h3_gpu_require_bf16(gpu, key_weight, (size_t)heads * head_dim * 5,
+                             @"VDN pair-query K temporal weight") ||
+        !h3_gpu_require_bf16(gpu, value_weight, (size_t)heads * head_dim * 5,
+                             @"VDN pair-query V temporal weight") ||
+        !h3_gpu_require_bf16(gpu, key_feature, count,
+                             @"VDN pair-query K temporal output") ||
+        !h3_gpu_require_bf16(gpu, value_feature, count,
+                             @"VDN pair-query V temporal output") ||
+        !h3_gpu_require_bf16(gpu, query_feature, count,
+                             @"VDN pair-query Q output")) return 0;
+    h3_vdn_feature_args args = {
+        source_row, frames, tokens_per_frame, 0, 0,
+        heads, head_dim, 0, 1
+    };
+    int vec4 = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_TEMPORAL_VEC4");
+    return h3_gpu_dispatch_2d(gpu, vec4 ?
+        @"h3_vdn_temporal_feature_pair_query_vec4_bf16" :
+        @"h3_vdn_temporal_feature_pair_query_bf16", (uint32_t)rows, heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key_spatial).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(value_spatial).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(key_weight).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(value_weight).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(key_feature).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(value_feature).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(query_feature).buffer offset:0 atIndex:7];
+            [encoder setBytes:&args length:sizeof(args) atIndex:8];
         });
 }
 

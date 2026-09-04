@@ -155,7 +155,8 @@ H3_VDN_FP16_STATS=1 H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
 H3_VDN_FUSED_INT8_QKV=1 H3_VDN_FUSED_INT8_QKV_INPUT=1 \
 H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
-H3_VDN_FUSED_KV_CONV=1 H3_VDN_PRECOMPUTE_DECAY=1 \
+H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
+H3_VDN_PRECOMPUTE_DECAY=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_MPS_CHOLESKY=1 \
 H3_MPSGRAPH_EXECUTABLE=1 \
 ./h3_dit_bench_full MiniMax-H3
@@ -164,6 +165,9 @@ H3_MPSGRAPH_EXECUTABLE=1 \
 The fused gate quantizer writes the attention-output int8 rows directly and
 avoids a full BF16 staging pass (it reserves an INNER-wide int8 scratch arena
 so the following VDN beta projections can still reuse their QKV quantization).
+`H3_VDN_FUSED_QUERY_FEATURE` folds the raw-Q SiLU/L2 pass into the fused temporal
+K/V convolution; it is selected only with `H3_VDN_FUSED_KV_CONV` and retains the
+old standalone kernel as the default fallback.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 

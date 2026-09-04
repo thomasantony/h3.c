@@ -774,6 +774,20 @@ int h3_gpu_vdn_temporal_feature_bf16_pair(
                      const h3_gpu_tensor *value_weight, uint32_t frames,
                      uint32_t tokens_per_frame, uint32_t heads,
                      uint32_t head_dim);
+/* Fused K/V temporal convolution plus the VDN query feature.  The query is
+ * read from the raw grouped QKV stream while the K/V pair is produced, so the
+ * standalone query-feature pass can be omitted.  SOURCE_ROW is the first row
+ * in GROUPED_QKV corresponding to the local temporal slice. */
+int h3_gpu_vdn_temporal_feature_bf16_pair_query(
+                     h3_gpu *gpu, h3_gpu_tensor *key_feature,
+                     h3_gpu_tensor *value_feature, h3_gpu_tensor *query_feature,
+                     const h3_gpu_tensor *grouped_qkv,
+                     const h3_gpu_tensor *key_spatial,
+                     const h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight, uint32_t source_row,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_frame_mean_f32(
                      h3_gpu *gpu, h3_gpu_tensor *mean,
                      const h3_gpu_tensor *input, uint32_t frames,

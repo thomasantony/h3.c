@@ -1215,6 +1215,191 @@ kernel void h3_vdn_temporal_feature_pair_vec4_bf16(
     }
 }
 
+/* The query feature is the SiLU/L2-normalized raw Q stream used only by the
+ * VDN branch.  This pair variant computes it while the temporal K/V pair is
+ * resident, preserving the standalone query kernel's BF16 rounding points and
+ * dimension order. */
+kernel void h3_vdn_temporal_feature_pair_query_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device const ushort *key_spatial [[buffer(1)]],
+                                device const ushort *value_spatial [[buffer(2)]],
+                                device const ushort *key_weight [[buffer(3)]],
+                                device const ushort *value_weight [[buffer(4)]],
+                                device ushort *key_output [[buffer(5)]],
+                                device ushort *value_output [[buffer(6)]],
+                                device ushort *query_output [[buffer(7)]],
+                                constant vdn_feature_args &args [[buffer(8)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint base = (row * args.heads + head) * args.head_dim;
+    /* Query features use the readout graph's [frame, head, token, dim]
+     * layout, unlike the temporal K/V features' [frame, token, head, dim]
+     * layout. */
+    uint query_base = ((frame * args.heads + head) * args.tokens_per_frame +
+                       token) * args.head_dim;
+    float key_sum_sq = 0.0f;
+    float query_sum_sq = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        uint channel = head * args.head_dim + d;
+        float key_sum = 0.0f;
+        float value_sum = 0.0f;
+        for (int kt = -2; kt <= 2; kt++) {
+            int sf = int(frame) + kt;
+            if (sf < 0 || sf >= int(args.frames)) continue;
+            uint source_row = uint(sf) * args.tokens_per_frame + token;
+            uint source = (source_row * args.heads + head) * args.head_dim + d;
+            uint tap = uint(kt + 2);
+            key_sum = fma(h3_bf16_to_f32(key_spatial[source]),
+                          h3_bf16_to_f32(key_weight[channel * 5 + tap]),
+                          key_sum);
+            value_sum = fma(h3_bf16_to_f32(value_spatial[source]),
+                            h3_bf16_to_f32(value_weight[channel * 5 + tap]),
+                            value_sum);
+        }
+        ushort key_feature = h3_f32_to_bf16(h3_vdn_silu(key_sum));
+        ushort value_feature = h3_f32_to_bf16(h3_vdn_silu(value_sum));
+        key_output[base + d] = key_feature;
+        value_output[base + d] = value_feature;
+        float key_rounded = h3_bf16_to_f32(key_feature);
+        key_sum_sq = fma(key_rounded, key_rounded, key_sum_sq);
+
+        uint q_source = h3_vdn_grouped_index(
+            args.source_row + row, head, 0, d, args.heads, args.head_dim);
+        ushort query_feature = h3_f32_to_bf16(
+            h3_vdn_silu(h3_bf16_to_f32(qkv[q_source])));
+        query_output[query_base + d] = query_feature;
+        float query_rounded = h3_bf16_to_f32(query_feature);
+        query_sum_sq = fma(query_rounded, query_rounded, query_sum_sq);
+    }
+    float key_inverse = rsqrt(max(key_sum_sq, 1.0e-24f));
+    float query_inverse = rsqrt(max(query_sum_sq, 1.0e-24f));
+    for (uint d = 0; d < args.head_dim; d++) {
+        key_output[base + d] = h3_f32_to_bf16(
+            h3_bf16_to_f32(key_output[base + d]) * key_inverse);
+        query_output[query_base + d] = h3_f32_to_bf16(
+            h3_bf16_to_f32(query_output[query_base + d]) * query_inverse);
+    }
+}
+
+kernel void h3_vdn_temporal_feature_pair_query_vec4_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device const ushort *key_spatial [[buffer(1)]],
+                                device const ushort *value_spatial [[buffer(2)]],
+                                device const ushort *key_weight [[buffer(3)]],
+                                device const ushort *value_weight [[buffer(4)]],
+                                device ushort *key_output [[buffer(5)]],
+                                device ushort *value_output [[buffer(6)]],
+                                device ushort *query_output [[buffer(7)]],
+                                constant vdn_feature_args &args [[buffer(8)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint base = (row * args.heads + head) * args.head_dim;
+    uint query_base = ((frame * args.heads + head) * args.tokens_per_frame +
+                       token) * args.head_dim;
+    device ushort4 *key_output4 =
+        reinterpret_cast<device ushort4 *>(key_output + base);
+    device ushort4 *value_output4 =
+        reinterpret_cast<device ushort4 *>(value_output + base);
+    device ushort4 *query_output4 =
+        reinterpret_cast<device ushort4 *>(query_output + query_base);
+    uint vectors = args.head_dim / 4;
+    float key_sum_sq = 0.0f;
+    float query_sum_sq = 0.0f;
+    for (uint d = 0; d < args.head_dim; d += 4) {
+        uint channel = head * args.head_dim + d;
+        float4 key_sum = 0.0f;
+        float4 value_sum = 0.0f;
+        if (frame >= 2 && frame + 2 < args.frames) {
+            uint source_row = (frame - 2) * args.tokens_per_frame + token;
+            for (uint kt = 0; kt < 5; kt++) {
+                uint source = ((source_row + kt * args.tokens_per_frame) *
+                               args.heads + head) * args.head_dim + d;
+                float4 key_value = h3_bf16x4_to_f32(
+                    *reinterpret_cast<device const ushort4 *>(key_spatial + source));
+                float4 value_value = h3_bf16x4_to_f32(
+                    *reinterpret_cast<device const ushort4 *>(value_spatial + source));
+                ushort4 key_bits = ushort4(
+                    key_weight[(channel + 0) * 5 + kt],
+                    key_weight[(channel + 1) * 5 + kt],
+                    key_weight[(channel + 2) * 5 + kt],
+                    key_weight[(channel + 3) * 5 + kt]);
+                ushort4 value_bits = ushort4(
+                    value_weight[(channel + 0) * 5 + kt],
+                    value_weight[(channel + 1) * 5 + kt],
+                    value_weight[(channel + 2) * 5 + kt],
+                    value_weight[(channel + 3) * 5 + kt]);
+                key_sum = fma(key_value, h3_bf16x4_to_f32(key_bits), key_sum);
+                value_sum = fma(value_value,
+                                 h3_bf16x4_to_f32(value_bits), value_sum);
+            }
+        } else for (int kt = -2; kt <= 2; kt++) {
+            int sf = int(frame) + kt;
+            if (sf < 0 || sf >= int(args.frames)) continue;
+            uint source_row = uint(sf) * args.tokens_per_frame + token;
+            uint source = (source_row * args.heads + head) * args.head_dim + d;
+            uint tap = uint(kt + 2);
+            float4 key_value = h3_bf16x4_to_f32(
+                *reinterpret_cast<device const ushort4 *>(key_spatial + source));
+            float4 value_value = h3_bf16x4_to_f32(
+                *reinterpret_cast<device const ushort4 *>(value_spatial + source));
+            ushort4 key_bits = ushort4(
+                key_weight[(channel + 0) * 5 + tap],
+                key_weight[(channel + 1) * 5 + tap],
+                key_weight[(channel + 2) * 5 + tap],
+                key_weight[(channel + 3) * 5 + tap]);
+            ushort4 value_bits = ushort4(
+                value_weight[(channel + 0) * 5 + tap],
+                value_weight[(channel + 1) * 5 + tap],
+                value_weight[(channel + 2) * 5 + tap],
+                value_weight[(channel + 3) * 5 + tap]);
+            key_sum = fma(key_value, h3_bf16x4_to_f32(key_bits), key_sum);
+            value_sum = fma(value_value, h3_bf16x4_to_f32(value_bits), value_sum);
+        }
+        float4 key_activated = key_sum / (1.0f + exp(-key_sum));
+        float4 value_activated = value_sum / (1.0f + exp(-value_sum));
+        ushort4 key_feature = h3_f32x4_to_bf16(key_activated);
+        ushort4 value_feature = h3_f32x4_to_bf16(value_activated);
+        key_output4[d / 4] = key_feature;
+        value_output4[d / 4] = value_feature;
+        float4 key_rounded = h3_bf16x4_to_f32(key_feature);
+        key_sum_sq = fma(key_rounded.x, key_rounded.x, key_sum_sq);
+        key_sum_sq = fma(key_rounded.y, key_rounded.y, key_sum_sq);
+        key_sum_sq = fma(key_rounded.z, key_rounded.z, key_sum_sq);
+        key_sum_sq = fma(key_rounded.w, key_rounded.w, key_sum_sq);
+
+        uint q_source = h3_vdn_grouped_index(
+            args.source_row + row, head, 0, d, args.heads, args.head_dim);
+        float4 query_value = h3_bf16x4_to_f32(
+            *reinterpret_cast<device const ushort4 *>(qkv + q_source));
+        ushort4 query_feature = h3_f32x4_to_bf16(
+            query_value / (1.0f + exp(-query_value)));
+        query_output4[d / 4] = query_feature;
+        float4 query_rounded = h3_bf16x4_to_f32(query_feature);
+        query_sum_sq = fma(query_rounded.x, query_rounded.x, query_sum_sq);
+        query_sum_sq = fma(query_rounded.y, query_rounded.y, query_sum_sq);
+        query_sum_sq = fma(query_rounded.z, query_rounded.z, query_sum_sq);
+        query_sum_sq = fma(query_rounded.w, query_rounded.w, query_sum_sq);
+    }
+    float key_inverse = rsqrt(max(key_sum_sq, 1.0e-24f));
+    float query_inverse = rsqrt(max(query_sum_sq, 1.0e-24f));
+    for (uint vector = 0; vector < vectors; vector++) {
+        key_output4[vector] = h3_f32x4_to_bf16(
+            h3_bf16x4_to_f32(key_output4[vector]) * key_inverse);
+        query_output4[vector] = h3_f32x4_to_bf16(
+            h3_bf16x4_to_f32(query_output4[vector]) * query_inverse);
+    }
+}
+
 struct vdn_stats_pack_args {
     uint frames; uint tokens; uint heads; uint dim; uint value_pass;
 };
