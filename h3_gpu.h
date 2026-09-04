@@ -853,6 +853,17 @@ int h3_gpu_vdn_solve_f32(
                      h3_gpu_tensor *rhs, h3_gpu_tensor *solution,
                      const h3_gpu_tensor *alpha,
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
+/* Solve variant that writes the compact FP16 transition/injection banks into
+ * scan_workspace as part of the final solve-pack pass.  The workspace is an
+ * F32 tensor only for ownership/capacity accounting; its bytes are viewed as
+ * half values by h3_gpu_vdn_scan_fp16_prepacked(). */
+int h3_gpu_vdn_solve_f32_fp16_scan(
+                     h3_gpu *gpu, h3_gpu_tensor *a_factor,
+                     h3_gpu_tensor *injection,
+                     h3_gpu_tensor *rhs, h3_gpu_tensor *solution,
+                     const h3_gpu_tensor *alpha,
+                     h3_gpu_tensor *scan_workspace,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_scale_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements,
                      float scale);
@@ -878,6 +889,16 @@ int h3_gpu_vdn_scan_fp16(
                      const h3_gpu_tensor *injection,
                      const h3_gpu_tensor *solution,
                      h3_gpu_tensor *scratch,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
+/* Same scan, but scan_workspace already contains the compact FP16 transition
+ * and injection banks produced by h3_gpu_vdn_solve_f32_fp16_scan(). */
+int h3_gpu_vdn_scan_fp16_prepacked(
+                     h3_gpu *gpu, h3_gpu_tensor *prefix,
+                     h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *injection,
+                     const h3_gpu_tensor *solution,
+                     h3_gpu_tensor *scan_workspace,
                      const h3_gpu_tensor *text_state,
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_gather_state_bf16(

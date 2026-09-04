@@ -1745,6 +1745,9 @@ kernel void h3_vdn_alpha_vec4_f32(
 }
 
 struct vdn_solve_args { uint batches; uint dim; };
+struct vdn_solve_pack_args {
+    uint batches; uint dim; uint fp16_scan;
+};
 /* Prepare the SPD matrices and identity right-hand sides for the optional
  * MPS Cholesky backend.  The existing fused kernel retains the hand-written
  * factor/triangular path; this small prepass deliberately does only the
@@ -1832,7 +1835,8 @@ kernel void h3_vdn_pack_solve_f32(
                                 device float *injection [[buffer(1)]],
                                 device float *transition [[buffer(2)]],
                                 device const float *alpha [[buffer(3)]],
-                                constant vdn_solve_args &args [[buffer(4)]],
+                                constant vdn_solve_pack_args &args [[buffer(4)]],
+                                device half *scan_workspace [[buffer(5)]],
                                 uint index [[thread_position_in_grid]]) {
     uint matrix_size = args.dim * args.dim;
     uint count = args.batches * matrix_size;
@@ -1842,9 +1846,16 @@ kernel void h3_vdn_pack_solve_f32(
     uint row = element / args.dim;
     uint right = batch * matrix_size;
     uint bank_size = args.batches * matrix_size;
-    transition[index] = solved[right + element] *
-                        alpha[batch * args.dim + row];
-    injection[index] = solved[bank_size + right + element];
+    float transition_value = solved[right + element] *
+                             alpha[batch * args.dim + row];
+    float injection_value = solved[bank_size + right + element];
+    transition[index] = transition_value;
+    injection[index] = injection_value;
+    if (args.fp16_scan) {
+        uint half_bank_size = bank_size;
+        scan_workspace[index] = half(transition_value);
+        scan_workspace[half_bank_size + index] = half(injection_value);
+    }
 }
 
 kernel void h3_vdn_pack_solve_f32_vec4(
@@ -1852,7 +1863,8 @@ kernel void h3_vdn_pack_solve_f32_vec4(
                                 device float4 *injection [[buffer(1)]],
                                 device float4 *transition [[buffer(2)]],
                                 device const float *alpha [[buffer(3)]],
-                                constant vdn_solve_args &args [[buffer(4)]],
+                                constant vdn_solve_pack_args &args [[buffer(4)]],
+                                device half4 *scan_workspace [[buffer(5)]],
                                 uint index [[thread_position_in_grid]]) {
     uint matrix_size = args.dim * args.dim;
     uint vectors_per_matrix = matrix_size / 4u;
@@ -1864,8 +1876,15 @@ kernel void h3_vdn_pack_solve_f32_vec4(
     uint row = element / args.dim;
     uint bank_size = args.batches * vectors_per_matrix;
     float scale = alpha[matrix * args.dim + row];
-    transition[index] = solved[index] * scale;
-    injection[index] = solved[bank_size + index];
+    float4 transition_value = solved[index] * scale;
+    float4 injection_value = solved[bank_size + index];
+    transition[index] = transition_value;
+    injection[index] = injection_value;
+    if (args.fp16_scan) {
+        uint half_bank_size = bank_size;
+        scan_workspace[index] = half4(transition_value);
+        scan_workspace[half_bank_size + index] = half4(injection_value);
+    }
 }
 
 struct vdn_scale_args { uint elements; float scale; };
