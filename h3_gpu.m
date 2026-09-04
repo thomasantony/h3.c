@@ -560,6 +560,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4"];
             [names addObject:@"h3_vdn_readout_bf16_nax_r128"];
+            [names addObject:@"h3_vdn_readout_bf16_nax_r128x128"];
             [names addObject:@"h3_vdn_scan_fp16_nax_fused"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
@@ -3993,9 +3994,15 @@ int h3_gpu_vdn_readout_bf16(
      * for older devices and numerical A/B comparisons. */
     if (gpu.tensorOpsEnabled && getenv("H3_VDN_TENSOR_READOUT") &&
         dim % 64 == 0 && batches <= UINT32_MAX / tokens) {
+        BOOL wide = dim == 128 && getenv("H3_VDN_TENSOR_READOUT_128");
+        NSString *pipeline_name = wide ?
+            @"h3_vdn_readout_bf16_nax_r128x128" :
+            @"h3_vdn_readout_bf16_nax_r128";
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-            gpu, @"h3_vdn_readout_bf16_nax_r128");
-        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+            gpu, pipeline_name);
+        NSUInteger required_threads = wide ? 256u : 128u;
+        if (!pipeline ||
+            pipeline.maxTotalThreadsPerThreadgroup < required_threads) {
             h3_gpu_set_error(gpu,
                 @"device cannot dispatch TensorOps VDN readout");
             return 0;
@@ -4003,7 +4010,7 @@ int h3_gpu_vdn_readout_bf16(
         typedef struct { uint32_t batches, tokens, dim; } args_type;
         args_type args = {(uint32_t)batches, tokens, dim};
         uint32_t row_tiles = (tokens + 127u) / 128u;
-        uint32_t column_tiles = (dim + 63u) / 64u;
+        uint32_t column_tiles = wide ? 1u : (dim + 63u) / 64u;
         @autoreleasepool {
             id<MTLComputeCommandEncoder> encoder =
                 [gpu.command computeCommandEncoder];
@@ -4014,7 +4021,7 @@ int h3_gpu_vdn_readout_bf16(
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
             [encoder dispatchThreadgroups:
                 MTLSizeMake(row_tiles, column_tiles, batches)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(required_threads, 1, 1)];
             [encoder endEncoding];
         }
         h3_gpu_stats stats = gpu.stats;

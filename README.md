@@ -157,7 +157,8 @@ H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
 H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
-H3_VDN_TENSOR_READOUT=1 H3_VDN_FP16_SCAN=1 H3_VDN_TENSOR_SCAN=1 \
+H3_VDN_TENSOR_READOUT=1 H3_VDN_TENSOR_READOUT_128=1 \
+H3_VDN_FP16_SCAN=1 H3_VDN_TENSOR_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
 H3_VDN_STATS_GATE_REUSE=1 H3_INT8_LINEAR_KNOWN_LONG=1 \
@@ -178,6 +179,8 @@ Metal 4 TensorOps; the existing vectorized GEMV remains the fallback.
 `H3_VDN_TENSOR_READOUT` routes the per-frame/head VDN state readout through a
 direct Metal 4 TensorOps tile, avoiding the MPSGraph transpose/feed wrapper;
 the graph readout remains the fallback when the flag is unset.
+`H3_VDN_TENSOR_READOUT_128=1` selects a fixed 128-column readout tile for the
+H3 head width, replacing the conservative two-tile 128x64 variant.
 `H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
 reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
 solve-pack pass emits those compact transition/injection banks directly, so

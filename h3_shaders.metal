@@ -2454,6 +2454,34 @@ kernel void h3_vdn_readout_bf16_nax_r128(
     mm.run(mx, mw, my);
 }
 
+/* Fixed H3 heads are exactly 128 values wide.  A single 128-column
+ * cooperative tile therefore covers the complete state matrix and halves the
+ * number of readout groups versus the conservative 128x64 kernel above. */
+kernel void h3_vdn_readout_bf16_nax_r128x128(
+                                device bfloat *query [[buffer(0)]],
+                                device bfloat *state [[buffer(1)]],
+                                device bfloat *output [[buffer(2)]],
+                                constant vdn_readout_args &args [[buffer(3)]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        query, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.tokens)));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        state, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.dim)));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        output, dextents<int32_t, 2>((int)args.dim,
+                                     (int)(args.batches * args.tokens)));
+    uint query_row = group.z * args.tokens + group.x * 128;
+    auto mx = x.slice(0, (int)query_row);
+    auto mw = w.slice(0, (int)(group.z * args.dim));
+    auto my = y.slice(0, (int)query_row);
+    matmul2d<matmul2d_descriptor(128, 128, dynamic_extent,
+                                 false, true, false),
+             execution_simdgroups<8>> mm;
+    mm.run(mx, mw, my);
+}
+
 /* The MPS FP16 scan encodes one matrix product per frame because each state
  * depends on the preceding frame.  On Metal 4 a head can instead retain its
  * 128x128 state in threadgroup memory while the loop walks the whole
