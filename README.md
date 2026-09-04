@@ -137,9 +137,11 @@ H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
   -o outputs/fox-vdn-fast.mp4
 ```
 
-The same 35-block core benchmark completed in 26.71 seconds with this preset,
-36% below the original 41.73 seconds. Its FP16 and int8 rounding changes output
-bytes, so use the preceding BF16 path when numerical closeness is the priority.
+The configuration before the fused-statistics flag completed the same 35-block
+core benchmark in 26.71 seconds, 36% below the original 41.73 seconds. The
+fused-statistics flag is an additional unmeasured optimization aimed at the
+25-second target. These FP16 and int8 paths change output bytes, so use the
+preceding BF16 path when numerical closeness is the priority.
 
 For a more aggressive 35-block run, enable the fused VDN producer, direct
 head-major QKV path, and branch-local quantizer. These keep the same arbitrary
