@@ -28,6 +28,30 @@ inline ushort4 h3_f32x4_to_bf16(float4 value) {
     return ushort4(bits >> 16);
 }
 
+/* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
+ * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
+inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
+                                ushort simdgroup, ushort lane) {
+    value = max(value, simd_shuffle_xor(value, 16));
+    value = max(value, simd_shuffle_xor(value, 8));
+    value = max(value, simd_shuffle_xor(value, 4));
+    value = max(value, simd_shuffle_xor(value, 2));
+    value = max(value, simd_shuffle_xor(value, 1));
+    if (lane == 0) scratch[simdgroup] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        value = lane < 8 ? scratch[lane] : 0.0f;
+        value = max(value, simd_shuffle_xor(value, 16));
+        value = max(value, simd_shuffle_xor(value, 8));
+        value = max(value, simd_shuffle_xor(value, 4));
+        value = max(value, simd_shuffle_xor(value, 2));
+        value = max(value, simd_shuffle_xor(value, 1));
+        if (lane == 0) scratch[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
 struct h3_convert_16_args {
     uint source_offset; uint destination_offset; uint vectors;
 };
@@ -1769,7 +1793,6 @@ kernel void h3_vdn_pack_solve_f32(
     uint batch = index / matrix_size;
     uint element = index - batch * matrix_size;
     uint row = element / args.dim;
-    uint column = element - row * args.dim;
     uint right = batch * matrix_size;
     uint bank_size = args.batches * matrix_size;
     transition[index] = solved[right + element] *
@@ -2842,30 +2865,6 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
     if (row < args.rows && column < args.output_dim) {
         output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
     }
-}
-
-/* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
- * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
-inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
-                                ushort simdgroup, ushort lane) {
-    value = max(value, simd_shuffle_xor(value, 16));
-    value = max(value, simd_shuffle_xor(value, 8));
-    value = max(value, simd_shuffle_xor(value, 4));
-    value = max(value, simd_shuffle_xor(value, 2));
-    value = max(value, simd_shuffle_xor(value, 1));
-    if (lane == 0) scratch[simdgroup] = value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simdgroup == 0) {
-        value = lane < 8 ? scratch[lane] : 0.0f;
-        value = max(value, simd_shuffle_xor(value, 16));
-        value = max(value, simd_shuffle_xor(value, 8));
-        value = max(value, simd_shuffle_xor(value, 4));
-        value = max(value, simd_shuffle_xor(value, 2));
-        value = max(value, simd_shuffle_xor(value, 1));
-        if (lane == 0) scratch[0] = value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return scratch[0];
 }
 
 #ifdef H3_METAL_HAS_TENSOR
