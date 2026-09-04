@@ -138,37 +138,32 @@ H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
 ```
 
 The configuration before the fused-statistics flag completed the same 35-block
-core benchmark in 26.71 seconds, 36% below the original 41.73 seconds. The
-fused-statistics flag is an additional unmeasured optimization aimed at the
-25-second target. These FP16 and int8 paths change output bytes, so use the
-preceding BF16 path when numerical closeness is the priority.
+core benchmark in 26.71 seconds, 36% below the original 41.73 seconds. These
+FP16 and int8 paths change output bytes, so use the preceding BF16 path when
+numerical closeness is the priority.
 
-For a more aggressive 35-block run, enable the fused VDN producer, direct
-head-major QKV path, and branch-local quantizer. These keep the same arbitrary
-sequence/window planner but intentionally trade additional FP16/int8 rounding
-for throughput:
+For the fastest measured long-sequence configuration, keep the original
+five-frame window span but use one window per MPS attention dispatch. On the
+M5 Max 864x480/102-frame benchmark this measured 24.95 seconds for 35 blocks
+(individual runs vary with GPU thermals); larger window batches were slower
+despite issuing fewer launches:
 
 ```sh
 H3_BENCH_SYNTHETIC_TEXT=1 \
-H3_BENCH_VDN=./vdn-checkpoints/stage-dmd-step-250 \
+H3_BENCH_VDN=../vdn-minimax-h3/ckpts/stage-dmd-step-250 \
 H3_BENCH_LAYERS=35 H3_BENCH_FORWARD_COUNT=1 \
 H3_BENCH_INT8_ROW_FC2=1 H3_VDN_INT8_ATTENTION_OUT=1 \
 H3_VDN_FP16_STATS=1 H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
 H3_VDN_FUSED_INT8_QKV=1 H3_VDN_FUSED_INT8_QKV_INPUT=1 \
 H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
-H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
-H3_VDN_FP16_STATS_FUSED=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
-H3_VDN_TENSOR_READOUT=1 H3_VDN_TENSOR_READOUT_128=1 \
-H3_VDN_TENSOR_READOUT_256=1 \
-H3_VDN_WINDOW_BATCH=8 \
-H3_VDN_FP16_SCAN=1 H3_VDN_TENSOR_SCAN=1 \
+H3_VDN_TENSOR_READOUT=1 H3_VDN_WINDOW_BATCH=1 \
+H3_VDN_FP16_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
 H3_VDN_STATS_GATE_REUSE=1 H3_INT8_LINEAR_KNOWN_LONG=1 \
 H3_VDN_DECAY_CHUNKED=1 H3_VDN_LINEAR_KNOWN=1 H3_INT8_LINEAR_ROW256=1 \
-H3_INT8_FC1_ROW256=1 H3_INT8_FC2_ROW256_LONG=1 \
 H3_VDN_MPS_CHOLESKY=1 \
 H3_MPSGRAPH_EXECUTABLE=1 \
 ./h3_dit_bench_full MiniMax-H3
@@ -177,28 +172,24 @@ H3_MPSGRAPH_EXECUTABLE=1 \
 The fused gate quantizer writes the attention-output int8 rows directly and
 avoids a full BF16 staging pass (it reserves an INNER-wide int8 scratch arena
 so the following VDN beta projections can still reuse their QKV quantization).
-`H3_VDN_FUSED_QUERY_FEATURE` folds the raw-Q SiLU/L2 pass into the fused temporal
-K/V convolution; it is selected only with `H3_VDN_FUSED_KV_CONV` and retains the
-old standalone kernel as the default fallback.
+`H3_VDN_FUSED_QUERY_FEATURE=1` folds the raw-Q SiLU/L2 pass into the fused temporal
+K/V convolution. It is retained as an experimental path; the standalone
+producer is faster on the measured M5 long-sequence workload.
 `H3_VDN_FP16_STATS_FUSED=1` additionally folds temporal K/V production, raw-Q
 feature normalization, beta gating, and BF16-to-FP16 statistics packing into
-one fixed-shape launch. It is selected only with `H3_VDN_FP16_STATS=1` and the
-two fused convolution flags; the existing multi-pass path remains the fallback.
+one fixed-shape launch. It remains experimental because the fused producer was
+slower than the multi-pass path in the measured 35-block run.
 `H3_VDN_TENSOR_LINEAR` routes the F32-by-BF16 VDN alpha projections through
 Metal 4 TensorOps; the existing vectorized GEMV remains the fallback.
 `H3_VDN_TENSOR_READOUT` routes the per-frame/head VDN state readout through a
 direct Metal 4 TensorOps tile, avoiding the MPSGraph transpose/feed wrapper;
 the graph readout remains the fallback when the flag is unset.
-`H3_VDN_TENSOR_READOUT_128=1` selects a fixed 128-column readout tile for the
-H3 head width, replacing the conservative two-tile 128x64 variant.
-`H3_VDN_TENSOR_READOUT_256=1` additionally selects a 256-row readout tile
-with a 512-thread cooperative group; it is only used with the fixed 128-wide
-head tile and falls back automatically when the device cannot dispatch it.
 `H3_VDN_WINDOW_BATCH=1` through `8` controls how many same-shaped five-frame
-windows are packed into one attention dispatch (the default is `4`). Larger
-values reduce dispatch overhead at the cost of additional temporary window
-memory; the allocator still reduces the requested value when the 1 GiB scratch
-budget would be exceeded.
+windows are packed into one attention dispatch (the default is `4`). The
+long-sequence M5 preset uses `1`; larger values reduce launch count but were
+slower on the measured 864x480 workload. `H3_VDN_WINDOW_FRAMES` changes the
+five-frame span for experiments; the default should be retained for the
+checkpoint's trained local-window behavior.
 `H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
 reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
 solve-pack pass emits those compact transition/injection banks directly, so
@@ -235,12 +226,9 @@ remain available for A/B comparison.
 VDN 5,376-wide beta/softmax gates) into 256-row, 16-SIMD-group TensorOps tiles,
 with automatic fallback to the 128-row kernels when the device cannot dispatch
 512-thread groups.
-`H3_INT8_FC1_ROW256=1` applies the same wider-row strategy to the fixed
-5,376->14,336 SwiGLU FC1 projection used by every H3 block; the activation
-arena is padded to 256 rows and the 128-row kernel remains the fallback.
-`H3_INT8_FC2_ROW256_LONG=1` extends the row-scaled 128x256 FC2 tile to long
-sequences such as the 35-block 864x480 benchmark. It is opt-in because the
-existing 128x128-output tile remains faster on some devices.
+`H3_INT8_FC1_ROW256=1` and `H3_INT8_FC2_ROW256_LONG=1` are experimental wider-row
+tiles. They were slower than the conservative row tiles on the measured M5
+long-sequence workload and are not part of the recommended preset.
 `H3_INT8_LINEAR_KNOWN_LONG=1` extends the compile-time 7,168→5,376 int8
 projection kernel to long VDN row counts; it is opt-in because the generic
 dynamic-shape kernel can win on some devices.
