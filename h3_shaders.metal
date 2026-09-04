@@ -5332,6 +5332,72 @@ template [[host_name("h3_linear_int8_nax_r128x64_output56_k5376")]]
 kernel h3_linear_int8_nax_r128x64_output56_t
     h3_linear_int8_nax_r128x64_output56_impl<5376>;
 
+/* The VDN beta and softmax gates are long 5,376-wide projections with only
+ * 56 output channels.  The ordinary output56 tile owns 128 rows per
+ * cooperative group; at the long video row counts a 256-row tile keeps more
+ * TensorOps work in flight while retaining the same padded 64-column weight
+ * layout and per-channel scaling. */
+template<uint INPUT_DIM>
+kernel void h3_linear_int8_nax_r256x64_output56_impl(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           device const ushort *bias [[buffer(6)]],
+                           uint row_tile [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW_TILE = 256;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint OUTPUT_DIM = 56;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_start = row_tile * ROW_TILE;
+    uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)input_dim,
+                                     (int)COLUMN_TILE));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, 128, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto first_a = x.slice<ROW_TILE, 128>(0, (int)row_start);
+    auto first_b = w.slice<128, COLUMN_TILE>(0, 0);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < input_dim; k += 128) {
+        auto a = x.slice<ROW_TILE, 128>((int)k, (int)row_start);
+        auto b = w.slice<128, COLUMN_TILE>((int)k, 0);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = (uint)index[0];
+        if (row < args.rows && column < OUTPUT_DIM) {
+            float value = (float)accum[element] * input_scales[row] *
+                          weight_scales[column];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            output[row * OUTPUT_DIM + column] = (bfloat)value;
+        }
+    }
+}
+typedef decltype(h3_linear_int8_nax_r256x64_output56_impl<0>)
+    h3_linear_int8_nax_r256x64_output56_t;
+template [[host_name("h3_linear_int8_nax_r256x64_output56")]]
+kernel h3_linear_int8_nax_r256x64_output56_t
+    h3_linear_int8_nax_r256x64_output56_impl<0>;
+template [[host_name("h3_linear_int8_nax_r256x64_output56_k5376")]]
+kernel h3_linear_int8_nax_r256x64_output56_t
+    h3_linear_int8_nax_r256x64_output56_impl<5376>;
+
 /* One-scale FC2 path. A static full-K product lets NAX own the
  * complete 14336-wide reduction; scale loads overlap that long operation. */
 kernel void h3_linear_int8_nax_r128_full_k14336(

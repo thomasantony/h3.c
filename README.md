@@ -218,9 +218,10 @@ the original per-frame log/exp kernel remains the fallback.
 `H3_VDN_LINEAR_KNOWN=1` selects compile-time K-loop instances for the VDN
 5,376→56, 5,376→128, and 128→7,168 int8 projections; dynamic-shape kernels
 remain available for A/B comparison.
-`H3_INT8_LINEAR_ROW256=1` opts long fixed-shape projections into 256-row,
-16-SIMD-group TensorOps tiles, with automatic fallback to the 128-row kernels
-when the device cannot dispatch 512-thread groups.
+`H3_INT8_LINEAR_ROW256=1` opts long fixed-shape projections (including the
+VDN 5,376-wide beta/softmax gates) into 256-row, 16-SIMD-group TensorOps tiles,
+with automatic fallback to the 128-row kernels when the device cannot dispatch
+512-thread groups.
 `H3_INT8_FC1_ROW256=1` applies the same wider-row strategy to the fixed
 5,376->14,336 SwiGLU FC1 projection used by every H3 block; the activation
 arena is padded to 256 rows and the 128-row kernel remains the fallback.

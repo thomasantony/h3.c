@@ -571,6 +571,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128x64_output56"];
             [names addObject:@"h3_linear_int8_nax_r128x64_output56_k5376"];
+            [names addObject:@"h3_linear_int8_nax_r256x64_output56"];
+            [names addObject:@"h3_linear_int8_nax_r256x64_output56_k5376"];
             [names addObject:
                 @"h3_linear_int8_nax_r128_full_k14336"];
             [names addObject:
@@ -5596,8 +5598,11 @@ int h3_gpu_linear_int8_56_bf16_offset(
                             uint32_t input_row, uint32_t rows,
                             uint32_t input_dim, int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
-    if (rows > UINT32_MAX - 127u) return 0;
-    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (rows > UINT32_MAX - 255u) return 0;
+    BOOL row256_requested = input_dim == 5376u && rows >= 256u &&
+        getenv("H3_INT8_LINEAR_ROW256") != NULL;
+    uint32_t padded_rows = row256_requested ?
+        (rows + 255u) & ~255u : (rows + 127u) & ~127u;
     size_t input_offset = (size_t)input_row * input_dim;
     size_t input_count = (size_t)rows * input_dim;
     size_t quantized_count = (size_t)padded_rows * input_dim;
@@ -5628,13 +5633,24 @@ int h3_gpu_linear_int8_56_bf16_offset(
         (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
             input_dim, 1.0f, @"VDN int8 gate input"))) return 0;
-    NSString *pipeline_name = input_dim == 5376 &&
-        getenv("H3_VDN_LINEAR_KNOWN") ?
-        @"h3_linear_int8_nax_r128x64_output56_k5376" :
-        @"h3_linear_int8_nax_r128x64_output56";
+    BOOL known = input_dim == 5376u && getenv("H3_VDN_LINEAR_KNOWN");
+    NSString *pipeline_name = row256_requested ?
+        (known ? @"h3_linear_int8_nax_r256x64_output56_k5376" :
+                 @"h3_linear_int8_nax_r256x64_output56") :
+        (known ? @"h3_linear_int8_nax_r128x64_output56_k5376" :
+                 @"h3_linear_int8_nax_r128x64_output56");
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, pipeline_name);
-    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
+    BOOL row256 = row256_requested && pipeline &&
+        pipeline.maxTotalThreadsPerThreadgroup >= 512u;
+    if (!row256) {
+        pipeline_name = known ?
+            @"h3_linear_int8_nax_r128x64_output56_k5376" :
+            @"h3_linear_int8_nax_r128x64_output56";
+        pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+    }
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup <
+        (row256 ? 512u : 128u)) return 0;
     linear_args args = {rows, input_dim, 56, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : output;
     @autoreleasepool {
@@ -5653,8 +5669,11 @@ int h3_gpu_linear_int8_56_bf16_offset(
                      offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake(padded_rows / 128u, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        uint32_t row_tile = row256 ? 256u : 128u;
+        [encoder dispatchThreadgroups:
+            MTLSizeMake(padded_rows / row_tile, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(row256 ? 512u : 128u,
+                                                    1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
