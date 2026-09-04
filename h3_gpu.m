@@ -1073,7 +1073,8 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
-typedef struct { uint32_t batches, dim, fp16_scan; } vdn_solve_pack_args;
+typedef struct { uint32_t batches, dim, fp16_scan, seed_scan; }
+    vdn_solve_pack_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
     uint32_t rows, padded_rows, heads, head_dim;
@@ -3168,18 +3169,21 @@ int h3_gpu_vdn_statistics_fp16(
 
 /* The solve-pack pass is also the last consumer of the F32 inverse/RHS
  * products.  When the following scan uses FP16 storage, convert those two
- * banks here while they are already resident in the cooperative output pass;
- * this removes a full solution/injection readback-and-convert dispatch per
- * VDN block. */
+ * banks here while they are already resident in the cooperative output pass.
+ * It can also seed PREFIX/SUFFIX's injection banks, avoiding two follow-up
+ * blit copies before the bidirectional scan. */
 static int h3_gpu_vdn_pack_solve_f32(
                      H3GPU *gpu, h3_gpu_tensor *injection,
                      h3_gpu_tensor *solution,
                      const h3_gpu_tensor *alpha,
                      h3_gpu_tensor *scan_workspace,
+                     h3_gpu_tensor *scan_prefix,
+                     h3_gpu_tensor *scan_suffix,
                      uint32_t batches, uint32_t matrices, uint32_t dim,
                      int vec4) {
     vdn_solve_pack_args args = {
-        batches, dim, scan_workspace ? 1u : 0u
+        batches, dim, scan_workspace ? 1u : 0u,
+        scan_prefix && scan_suffix ? 1u : 0u
     };
     NSString *name = vec4 ? @"h3_vdn_pack_solve_f32_vec4" :
                             @"h3_vdn_pack_solve_f32";
@@ -3187,6 +3191,8 @@ static int h3_gpu_vdn_pack_solve_f32(
     /* The kernel always binds a buffer at index 5.  Use the solve output as a
      * harmless placeholder when compact FP16 scan output is not requested. */
     h3_gpu_tensor *workspace = scan_workspace ? scan_workspace : solution;
+    h3_gpu_tensor *prefix = scan_prefix ? scan_prefix : solution;
+    h3_gpu_tensor *suffix = scan_suffix ? scan_suffix : solution;
     return h3_gpu_dispatch_1d(gpu, name, count,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:0];
@@ -3195,6 +3201,8 @@ static int h3_gpu_vdn_pack_solve_f32(
             [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
             [encoder setBuffer:TENSOR(workspace).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:7];
         });
 }
 
@@ -3204,6 +3212,8 @@ static int h3_gpu_vdn_solve_f32_impl(
                      h3_gpu_tensor *rhs, h3_gpu_tensor *solution,
                      const h3_gpu_tensor *alpha,
                      h3_gpu_tensor *scan_workspace,
+                     h3_gpu_tensor *scan_prefix,
+                     h3_gpu_tensor *scan_suffix,
                      uint32_t frames, uint32_t heads, uint32_t dim) {
     H3GPU *gpu = GPU(opaque);
     size_t batches = (size_t)frames * heads;
@@ -3217,7 +3227,11 @@ static int h3_gpu_vdn_solve_f32_impl(
         !h3_gpu_require_f32(gpu, solution, systems, @"VDN transition") ||
         !h3_gpu_require_f32(gpu, alpha, batches * dim, @"VDN solve alpha") ||
         (scan_workspace && !h3_gpu_require_f32(
-            gpu, scan_workspace, systems, @"VDN FP16 scan workspace")))
+            gpu, scan_workspace, systems, @"VDN FP16 scan workspace")) ||
+        (scan_prefix && (!scan_suffix || !h3_gpu_require_f32(
+            gpu, scan_prefix, matrices, @"VDN FP16 scan prefix"))) ||
+        (scan_suffix && (!scan_prefix || !h3_gpu_require_f32(
+            gpu, scan_suffix, matrices, @"VDN FP16 scan suffix"))))
         return 0;
     if (getenv("H3_VDN_MPS_CHOLESKY")) {
         typedef struct { uint32_t batches, dim; } args_type;
@@ -3279,6 +3293,7 @@ static int h3_gpu_vdn_solve_f32_impl(
             !getenv("H3_DISABLE_VDN_SOLVE_VEC4");
         return h3_gpu_vdn_pack_solve_f32(
             gpu, injection, solution, alpha, scan_workspace,
+            scan_prefix, scan_suffix,
             (uint32_t)batches, (uint32_t)matrices, dim, vec4);
     }
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
@@ -3337,6 +3352,7 @@ static int h3_gpu_vdn_solve_f32_impl(
     int vec4 = dim % 4 == 0 && !getenv("H3_DISABLE_VDN_SOLVE_VEC4");
     return h3_gpu_vdn_pack_solve_f32(
         gpu, injection, solution, alpha, scan_workspace,
+        scan_prefix, scan_suffix,
         (uint32_t)batches, (uint32_t)matrices, dim, vec4);
 }
 
@@ -3347,7 +3363,7 @@ int h3_gpu_vdn_solve_f32(
                      const h3_gpu_tensor *alpha,
                      uint32_t frames, uint32_t heads, uint32_t dim) {
     return h3_gpu_vdn_solve_f32_impl(
-        opaque, a, injection, rhs, solution, alpha, NULL,
+        opaque, a, injection, rhs, solution, alpha, NULL, NULL, NULL,
         frames, heads, dim);
 }
 
@@ -3360,6 +3376,22 @@ int h3_gpu_vdn_solve_f32_fp16_scan(
                      uint32_t frames, uint32_t heads, uint32_t dim) {
     return h3_gpu_vdn_solve_f32_impl(
         opaque, a, injection, rhs, solution, alpha, scan_workspace,
+        NULL, NULL,
+        frames, heads, dim);
+}
+
+int h3_gpu_vdn_solve_f32_fp16_scan_to_buffers(
+                     h3_gpu *opaque, h3_gpu_tensor *a,
+                     h3_gpu_tensor *injection,
+                     h3_gpu_tensor *rhs, h3_gpu_tensor *solution,
+                     const h3_gpu_tensor *alpha,
+                     h3_gpu_tensor *scan_workspace,
+                     h3_gpu_tensor *scan_prefix,
+                     h3_gpu_tensor *scan_suffix,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    return h3_gpu_vdn_solve_f32_impl(
+        opaque, a, injection, rhs, solution, alpha, scan_workspace,
+        scan_prefix, scan_suffix,
         frames, heads, dim);
 }
 
@@ -3500,7 +3532,7 @@ static int h3_gpu_vdn_scan_fp16_impl(
                      h3_gpu_tensor *scratch,
                      const h3_gpu_tensor *text_state,
                      uint32_t frames, uint32_t heads, uint32_t dim,
-                     int prepacked) {
+                     int prepacked, int initialized) {
     H3GPU *gpu = GPU(opaque);
     size_t matrix_elements = (size_t)heads * dim * dim;
     size_t bank_elements = (size_t)frames * matrix_elements;
@@ -3556,21 +3588,23 @@ static int h3_gpu_vdn_scan_fp16_impl(
         [encoder setBuffer:TENSOR(prefix).buffer
                        offset:text_offset atIndex:1];
     })) return 0;
-    @autoreleasepool {
-        id<MTLBlitCommandEncoder> encoder = [gpu.command blitCommandEncoder];
-        [encoder copyFromBuffer:TENSOR(scratch).buffer
-                   sourceOffset:half_bank_bytes
-                       toBuffer:TENSOR(prefix).buffer destinationOffset:0
-                          size:half_bank_bytes];
-        [encoder copyFromBuffer:TENSOR(scratch).buffer
-                   sourceOffset:half_bank_bytes
-                       toBuffer:TENSOR(suffix).buffer destinationOffset:0
-                          size:half_bank_bytes];
-        [encoder endEncoding];
+    if (!initialized) {
+        @autoreleasepool {
+            id<MTLBlitCommandEncoder> encoder = [gpu.command blitCommandEncoder];
+            [encoder copyFromBuffer:TENSOR(scratch).buffer
+                       sourceOffset:half_bank_bytes
+                           toBuffer:TENSOR(prefix).buffer destinationOffset:0
+                              size:half_bank_bytes];
+            [encoder copyFromBuffer:TENSOR(scratch).buffer
+                       sourceOffset:half_bank_bytes
+                           toBuffer:TENSOR(suffix).buffer destinationOffset:0
+                              size:half_bank_bytes];
+            [encoder endEncoding];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.blit_copies += 2;
+        gpu.stats = stats;
     }
-    h3_gpu_stats stats = gpu.stats;
-    stats.blit_copies += 2;
-    gpu.stats = stats;
 
     @autoreleasepool {
         NSUInteger row_bytes = (NSUInteger)dim * sizeof(uint16_t);
@@ -3635,7 +3669,7 @@ int h3_gpu_vdn_scan_fp16(
                      uint32_t frames, uint32_t heads, uint32_t dim) {
     return h3_gpu_vdn_scan_fp16_impl(
         opaque, prefix, suffix, injection, solution, scratch, text_state,
-        frames, heads, dim, 0);
+        frames, heads, dim, 0, 0);
 }
 
 int h3_gpu_vdn_scan_fp16_prepacked(
@@ -3648,7 +3682,20 @@ int h3_gpu_vdn_scan_fp16_prepacked(
                      uint32_t frames, uint32_t heads, uint32_t dim) {
     return h3_gpu_vdn_scan_fp16_impl(
         opaque, prefix, suffix, injection, solution, scratch, text_state,
-        frames, heads, dim, 1);
+        frames, heads, dim, 1, 0);
+}
+
+int h3_gpu_vdn_scan_fp16_prepacked_initialized(
+                     h3_gpu *opaque, h3_gpu_tensor *prefix,
+                     h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *injection,
+                     const h3_gpu_tensor *solution,
+                     h3_gpu_tensor *scratch,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    return h3_gpu_vdn_scan_fp16_impl(
+        opaque, prefix, suffix, injection, solution, scratch, text_state,
+        frames, heads, dim, 1, 1);
 }
 
 int h3_gpu_vdn_gather_state_bf16(

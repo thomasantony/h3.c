@@ -864,6 +864,18 @@ int h3_gpu_vdn_solve_f32_fp16_scan(
                      const h3_gpu_tensor *alpha,
                      h3_gpu_tensor *scan_workspace,
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
+/* Variant that also seeds PREFIX/SUFFIX's compact FP16 banks in the solve
+ * pack, allowing h3_gpu_vdn_scan_fp16_prepacked_initialized() to skip its
+ * two initialization blits. */
+int h3_gpu_vdn_solve_f32_fp16_scan_to_buffers(
+                     h3_gpu *gpu, h3_gpu_tensor *a_factor,
+                     h3_gpu_tensor *injection,
+                     h3_gpu_tensor *rhs, h3_gpu_tensor *solution,
+                     const h3_gpu_tensor *alpha,
+                     h3_gpu_tensor *scan_workspace,
+                     h3_gpu_tensor *scan_prefix,
+                     h3_gpu_tensor *scan_suffix,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_scale_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements,
                      float scale);
@@ -894,6 +906,16 @@ int h3_gpu_vdn_scan_fp16(
 /* Same scan, but scan_workspace already contains the compact FP16 transition
  * and injection banks produced by h3_gpu_vdn_solve_f32_fp16_scan(). */
 int h3_gpu_vdn_scan_fp16_prepacked(
+                     h3_gpu *gpu, h3_gpu_tensor *prefix,
+                     h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *injection,
+                     const h3_gpu_tensor *solution,
+                     h3_gpu_tensor *scan_workspace,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
+/* Same as the prepacked scan, but PREFIX/SUFFIX already contain their FP16
+ * injection banks from h3_gpu_vdn_solve_f32_fp16_scan_to_buffers(). */
+int h3_gpu_vdn_scan_fp16_prepacked_initialized(
                      h3_gpu *gpu, h3_gpu_tensor *prefix,
                      h3_gpu_tensor *suffix,
                      const h3_gpu_tensor *injection,

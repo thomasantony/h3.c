@@ -1800,7 +1800,7 @@ kernel void h3_vdn_alpha_vec4_f32(
 
 struct vdn_solve_args { uint batches; uint dim; };
 struct vdn_solve_pack_args {
-    uint batches; uint dim; uint fp16_scan;
+    uint batches; uint dim; uint fp16_scan; uint seed_scan;
 };
 /* Prepare the SPD matrices and identity right-hand sides for the optional
  * MPS Cholesky backend.  The existing fused kernel retains the hand-written
@@ -1891,6 +1891,8 @@ kernel void h3_vdn_pack_solve_f32(
                                 device const float *alpha [[buffer(3)]],
                                 constant vdn_solve_pack_args &args [[buffer(4)]],
                                 device half *scan_workspace [[buffer(5)]],
+                                device half *scan_prefix [[buffer(6)]],
+                                device half *scan_suffix [[buffer(7)]],
                                 uint index [[thread_position_in_grid]]) {
     uint matrix_size = args.dim * args.dim;
     uint count = args.batches * matrix_size;
@@ -1909,6 +1911,10 @@ kernel void h3_vdn_pack_solve_f32(
         uint half_bank_size = bank_size;
         scan_workspace[index] = half(transition_value);
         scan_workspace[half_bank_size + index] = half(injection_value);
+        if (args.seed_scan) {
+            scan_prefix[index] = half(injection_value);
+            scan_suffix[index] = half(injection_value);
+        }
     }
 }
 
@@ -1919,6 +1925,8 @@ kernel void h3_vdn_pack_solve_f32_vec4(
                                 device const float *alpha [[buffer(3)]],
                                 constant vdn_solve_pack_args &args [[buffer(4)]],
                                 device half4 *scan_workspace [[buffer(5)]],
+                                device half4 *scan_prefix [[buffer(6)]],
+                                device half4 *scan_suffix [[buffer(7)]],
                                 uint index [[thread_position_in_grid]]) {
     uint matrix_size = args.dim * args.dim;
     uint vectors_per_matrix = matrix_size / 4u;
@@ -1938,6 +1946,10 @@ kernel void h3_vdn_pack_solve_f32_vec4(
         uint half_bank_size = bank_size;
         scan_workspace[index] = half4(transition_value);
         scan_workspace[half_bank_size + index] = half4(injection_value);
+        if (args.seed_scan) {
+            scan_prefix[index] = half4(injection_value);
+            scan_suffix[index] = half4(injection_value);
+        }
     }
 }
 

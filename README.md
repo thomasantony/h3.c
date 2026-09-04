@@ -177,8 +177,10 @@ the graph readout remains the fallback when the flag is unset.
 `H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
 reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
 solve-pack pass emits those compact transition/injection banks directly, so
-the scan does not perform a second full-bank conversion; the default scan
-remains FP32 for numerical closeness.
+the scan does not perform a second full-bank conversion.  In the active
+inference path it also seeds the prefix/suffix injection banks in that same
+pass, removing two initialization blits; the default scan remains FP32 for
+numerical closeness.
 `H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1` additionally fuses the VDN epilogue with
 the row-wise int8 conversion used by the output projection, avoiding a full
 7,168-wide BF16 staging write/read.  It is restricted to the fixed H3 VDN

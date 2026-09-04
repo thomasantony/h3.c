@@ -2751,16 +2751,17 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             inner_frames, HEADS, HEAD_DIM), "VDN alpha activation");
     int fp16_scan = getenv("H3_VDN_FP16_SCAN") != NULL;
     VDN_OP(fp16_scan ?
-        h3_gpu_vdn_solve_f32_fp16_scan(
+        h3_gpu_vdn_solve_f32_fp16_scan_to_buffers(
             dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
             dit->vdn_solution, dit->vdn_alpha, dit->vdn_rhs,
+            dit->vdn_prefix, dit->vdn_suffix,
             inner_frames, HEADS, HEAD_DIM) :
         h3_gpu_vdn_solve_f32(
             dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
             dit->vdn_solution, dit->vdn_alpha,
             inner_frames, HEADS, HEAD_DIM), "VDN video solve");
     VDN_OP(fp16_scan ?
-        h3_gpu_vdn_scan_fp16_prepacked(
+        h3_gpu_vdn_scan_fp16_prepacked_initialized(
             dit->gpu, dit->vdn_prefix, dit->vdn_suffix, dit->vdn_b,
             dit->vdn_solution, dit->vdn_rhs, dit->vdn_text_state,
             inner_frames, HEADS, HEAD_DIM) :
