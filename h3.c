@@ -168,13 +168,14 @@ static char *h3_prepared_key(const char *conditioning,
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d|vdn=%s"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
+            params->vdn_checkpoint ? params->vdn_checkpoint : "none",
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,
@@ -555,6 +556,18 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
                          "be combined with int8 row FC2");
         return 0;
     }
+    if (params->vdn_checkpoint && !*params->vdn_checkpoint) {
+        h3_set_error(ctx, "VDN checkpoint path is empty");
+        return 0;
+    }
+    if (params->vdn_checkpoint && params->token_reduction) {
+        h3_set_error(ctx, "VDN mode does not yet support token reduction");
+        return 0;
+    }
+    if (params->vdn_checkpoint && params->ssd_streaming) {
+        h3_set_error(ctx, "VDN mode does not yet support SSD streaming");
+        return 0;
+    }
     if (params->use_int8_row_fc2 && params->use_slower_bf16_mlp) {
         h3_set_error(ctx, "int8 row FC2 cannot be combined with the BF16 MLP");
         return 0;
@@ -590,6 +603,13 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->reference_count && (params->first_frame || params->last_frame)) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
+        return 0;
+    }
+    if (params->vdn_checkpoint &&
+        (params->reference_count || params->first_frame || params->last_frame)) {
+        h3_set_error(ctx,
+            "VDN mode currently supports prompt-to-video/audio only; "
+            "Ref2VA and frame anchors are not yet enabled");
         return 0;
     }
     size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
@@ -1476,7 +1496,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, "h3_shaders.metal", params->vdn_checkpoint,
+            &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1497,7 +1518,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, "h3_shaders.metal", params->vdn_checkpoint,
+            &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,

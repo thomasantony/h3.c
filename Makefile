@@ -8,7 +8,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_vdn.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
@@ -43,6 +43,12 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_vdn_gpu_tests: tests/test_vdn_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_vdn_checkpoint_test: tests/test_vdn_checkpoint.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -87,9 +93,23 @@ h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_dit_bench_long: tests/bench_dit_long.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_dit_bench_full: tests/bench_dit_full.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 tests/bench_dit_864.o: tests/bench_dit.c
 	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_H=30 \
 		-DH3_BENCH_LATENT_W=54 -c $< -o $@
+
+tests/bench_dit_long.o: tests/bench_dit.c
+	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_T=102 \
+		-DH3_BENCH_LATENT_H=16 -DH3_BENCH_LATENT_W=16 -c $< -o $@
+
+tests/bench_dit_full.o: tests/bench_dit.c
+	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_T=102 \
+		-DH3_BENCH_LATENT_H=30 -DH3_BENCH_LATENT_W=54 -c $< -o $@
 
 h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -98,7 +118,7 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
-	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+	h3_audio_gpu_tests h3_vdn_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
@@ -122,6 +142,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		echo "skip: MLX Qwen fixture is not installed"; \
 	fi
 	./h3_audio_gpu_tests
+	./h3_vdn_gpu_tests
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \
@@ -205,11 +226,12 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
-		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+		h3_audio_gpu_tests h3_vdn_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+		h3_vdn_checkpoint_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 \
-	libh3.a *.o *.d tests/*.o tests/*.d
+		h3_dit_bench h3_dit_bench_864 h3_dit_bench_long h3_dit_bench_full \
+		libh3.a *.o *.d tests/*.o tests/*.d

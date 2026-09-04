@@ -235,7 +235,7 @@ cleanup:
 }
 
 h3_dit_schedule *h3_dit_schedule_precompute(
-    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_weight_store *weights, const h3_vdn *vdn, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
@@ -272,6 +272,16 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             error, error_size);
         h3_gpu_tensor *bias = weight_bf16_1d(
             weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
+        if (weight && vdn && h3_vdn_is_turbo(vdn)) {
+            char target[96];
+            snprintf(target, sizeof(target),
+                     "transformer_blocks.%u.adaln_proj.linear", block);
+            h3_gpu_tensor *adapted = h3_vdn_adapt_weight_bf16(
+                vdn, gpu, weight, BLOCK_OUTPUT, H3_DIT_TIME_DIM, target,
+                0, BLOCK_OUTPUT, error, error_size);
+            free_tensor(&weight);
+            weight = adapted;
+        }
         schedule->blocks[block] = h3_gpu_tensor_new_bf16(
             gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
         if (!weight || !bias || !schedule->blocks[block]) {
@@ -306,6 +316,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     h3_gpu_tensor *final_b = weight_bf16_1d(
         weights, gpu, "final_layer.adaln_proj.linear.bias",
         FINAL_OUTPUT, error, error_size);
+    if (final_w && vdn && h3_vdn_is_turbo(vdn)) {
+        h3_gpu_tensor *adapted = h3_vdn_adapt_weight_bf16(
+            vdn, gpu, final_w, FINAL_OUTPUT, H3_DIT_TIME_DIM,
+            "norm_out.linear", 0, FINAL_OUTPUT, error, error_size);
+        free_tensor(&final_w);
+        final_w = adapted;
+    }
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
     if (!final_w || !final_b || !schedule->final ||

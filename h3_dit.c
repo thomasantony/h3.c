@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_vdn.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -26,7 +27,8 @@ enum {
     ROPE_FREQS = 16,
     ROPE_HALF = 48,
     SLOTS = 6,
-    FINAL_SLOTS = 2
+    FINAL_SLOTS = 2,
+    VDN_WINDOW_BATCH_CAP = 4
 };
 
 typedef struct {
@@ -46,6 +48,7 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    h3_vdn_block vdn;
 } h3_dit_block;
 
 enum {
@@ -70,6 +73,7 @@ typedef struct {
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    h3_vdn *vdn;
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
@@ -168,6 +172,30 @@ struct h3_dit {
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
     h3_gpu_tensor *attention_output;
+    h3_gpu_tensor *vdn_window_query;
+    h3_gpu_tensor *vdn_window_key;
+    h3_gpu_tensor *vdn_window_value;
+    h3_gpu_tensor *vdn_window_output;
+    h3_gpu_tensor *vdn_softmax_gate;
+    uint32_t vdn_window_query_rows;
+    uint32_t vdn_window_kv_rows;
+    uint32_t vdn_window_batch;
+    h3_gpu_tensor *vdn_video_hidden;
+    h3_gpu_tensor *vdn_feature;
+    h3_gpu_tensor *vdn_gate_down;
+    h3_gpu_tensor *vdn_frame_mean;
+    h3_gpu_tensor *vdn_alpha_down;
+    h3_gpu_tensor *vdn_alpha;
+    h3_gpu_tensor *vdn_a;
+    h3_gpu_tensor *vdn_b;
+    h3_gpu_tensor *vdn_rhs;
+    h3_gpu_tensor *vdn_solution;
+    h3_gpu_tensor *vdn_text_alpha;
+    h3_gpu_tensor *vdn_text_state;
+    h3_gpu_tensor *vdn_prefix;
+    h3_gpu_tensor *vdn_suffix;
+    h3_gpu_tensor *vdn_state;
+    h3_gpu_tensor *vdn_projected;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
     h3_gpu_tensor *token_expand_parents;
@@ -499,7 +527,72 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+static int adapt_block(h3_dit *dit, h3_dit_block *block,
+                       const char *target_prefix, int original_attention,
+                       char *error, size_t error_size) {
+    if (!dit->vdn) return 1;
+    char target[160];
+    const char *attention = original_attention ? "attn.orig" : "attn";
+#define TARGET(suffix) do {                                                     \
+    int length = snprintf(target, sizeof(target), "%s.%s.%s",                \
+                          target_prefix, attention, suffix);                    \
+    if (length < 0 || (size_t)length >= sizeof(target)) {                       \
+        fail(error, error_size, "VDN block target name is too long");         \
+        return 0;                                                               \
+    }                                                                           \
+} while (0)
+    char q_target[160], k_target[160], v_target[160];
+    TARGET("to_q");
+    memcpy(q_target, target, strlen(target) + 1);
+    TARGET("to_k");
+    memcpy(k_target, target, strlen(target) + 1);
+    TARGET("to_v");
+    memcpy(v_target, target, strlen(target) + 1);
+    h3_gpu_tensor *qkv = h3_vdn_adapt_grouped_qkv_bf16(
+        dit->vdn, dit->gpu, block->qkv, HIDDEN, HEADS, HEAD_DIM,
+        q_target, k_target, v_target, error, error_size);
+    if (!qkv) return 0;
+    free_tensor(&block->qkv);
+    block->qkv = qkv;
+    TARGET("to_out.0");
+    h3_gpu_tensor *out = h3_vdn_adapt_weight_bf16(
+        dit->vdn, dit->gpu, block->out, HIDDEN, INNER, target,
+        0, HIDDEN, error, error_size);
+    if (!out) return 0;
+    free_tensor(&block->out);
+    block->out = out;
+#undef TARGET
+    if (h3_vdn_is_turbo(dit->vdn)) {
+        int length = snprintf(target, sizeof(target), "%s.ff.net.0.proj",
+                              target_prefix);
+        if (length < 0 || (size_t)length >= sizeof(target)) {
+            fail(error, error_size, "VDN MLP target name is too long");
+            return 0;
+        }
+        h3_gpu_tensor *fc1 = h3_vdn_adapt_swiglu_bf16(
+            dit->vdn, dit->gpu, block->fc1, HIDDEN, FFN, target,
+            error, error_size);
+        if (!fc1) return 0;
+        free_tensor(&block->fc1);
+        block->fc1 = fc1;
+        length = snprintf(target, sizeof(target), "%s.ff.net.2",
+                          target_prefix);
+        if (length < 0 || (size_t)length >= sizeof(target)) {
+            fail(error, error_size, "VDN MLP target name is too long");
+            return 0;
+        }
+        h3_gpu_tensor *fc2 = h3_vdn_adapt_weight_bf16(
+            dit->vdn, dit->gpu, block->fc2, HIDDEN, FFN, target,
+            0, HIDDEN, error, error_size);
+        if (!fc2) return 0;
+        free_tensor(&block->fc2);
+        block->fc2 = fc2;
+    }
+    return 1;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
+                      const char *target_prefix, int original_attention,
                       char *error, size_t error_size) {
     char name[160];
 #define LOAD1(field, suffix, width) do {                                       \
@@ -522,7 +615,8 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
-    return 1;
+    return adapt_block(dit, block, target_prefix, original_attention,
+                       error, error_size);
 }
 
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
@@ -559,6 +653,7 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    h3_vdn_free_block(&block->vdn);
 }
 
 static double stream_now(void) {
@@ -817,8 +912,10 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     h3_gpu_tensor *activated = NULL;
     int ok = source && condition_w && condition_b &&
         load_block(dit, &refiner[0], "token_refiner.blocks.0.",
+                   "token_refiner.refiner_blocks.0", 0,
                    error, error_size) &&
         load_block(dit, &refiner[1], "token_refiner.blocks.1.",
+                   "token_refiner.refiner_blocks.1", 0,
                    error, error_size);
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
@@ -1254,8 +1351,15 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
         } else {
+            char target_prefix[64];
+            snprintf(target_prefix, sizeof(target_prefix),
+                     "transformer_blocks.%u", index);
             if (!load_block(dit, &dit->blocks[index], prefix,
+                            target_prefix, 1,
                             error, error_size)) return 0;
+            if (dit->vdn && !h3_vdn_load_block(
+                    dit->vdn, dit->gpu, index, &dit->blocks[index].vdn,
+                    error, error_size)) return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1359,7 +1463,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t video = dit->video_rows;
     size_t audio_total = dit->audio_total_rows;
     size_t video_total = dit->video_total_rows;
-    dit->activation_aliases = !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
+    dit->activation_aliases = !dit->vdn &&
+        !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
     dit->fused_patch_projection =
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
     dit->fused_patch_pack = dit->fused_patch_projection &&
@@ -1432,6 +1537,107 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
              "cannot allocate DiT activation buffers: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (dit->vdn) {
+        uint64_t frame_rows = (uint64_t)(uint32_t)dit->latent_h / 2 *
+                              ((uint32_t)dit->latent_w / 2);
+        uint64_t dense_rows = dit->video_target_start + frame_rows * 2;
+        uint64_t chunk_rows = frame_rows * 5;
+        uint64_t window_frames = (uint32_t)dit->latent_t < 17u ?
+            (uint32_t)dit->latent_t : 17u;
+        uint64_t kv_rows = dit->video_target_start + window_frames * frame_rows;
+        if (kv_rows > dit->sequence) kv_rows = dit->sequence;
+        uint64_t kv_bytes = kv_rows * INNER * sizeof(uint16_t);
+        uint64_t batch = VDN_WINDOW_BATCH_CAP;
+        const uint64_t scratch_limit = 1ull << 30;
+        if (kv_bytes && batch * kv_bytes > scratch_limit) {
+            batch = scratch_limit / kv_bytes;
+            if (!batch) batch = 1;
+        }
+        uint64_t query_rows = chunk_rows * batch;
+        if (dense_rows > query_rows) query_rows = dense_rows;
+        uint64_t kv_capacity = kv_rows * batch;
+        if (!frame_rows ||
+            frame_rows * (uint32_t)dit->latent_t != dit->video_rows ||
+            dit->video_target_start + dit->video_rows != dit->sequence ||
+            query_rows > UINT32_MAX || kv_rows > UINT32_MAX ||
+            kv_capacity > UINT32_MAX) {
+            fail(error, error_size,
+                 "VDN requires a contiguous target-video frame grid");
+            return 0;
+        }
+        dit->vdn_window_query_rows = (uint32_t)query_rows;
+        dit->vdn_window_kv_rows = (uint32_t)kv_capacity;
+        dit->vdn_window_batch = (uint32_t)batch;
+        dit->vdn_window_query = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)query_rows * INNER);
+        dit->vdn_window_key = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)kv_capacity * INNER);
+        dit->vdn_window_value = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)kv_capacity * INNER);
+        dit->vdn_window_output = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)query_rows * INNER);
+        dit->vdn_softmax_gate = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HEADS);
+        uint32_t inner_frames = (uint32_t)dit->latent_t > 2 ?
+            (uint32_t)dit->latent_t - 2 : 0;
+        size_t inner_rows = (size_t)inner_frames * frame_rows;
+        size_t state_elements = (size_t)inner_frames * HEADS *
+                                HEAD_DIM * HEAD_DIM;
+        size_t alpha_elements = (size_t)inner_frames * INNER;
+        if (inner_frames) {
+            dit->vdn_video_hidden = h3_gpu_tensor_new_bf16(
+                dit->gpu, inner_rows * HIDDEN);
+            dit->vdn_feature = h3_gpu_tensor_new_bf16(
+                dit->gpu, inner_rows * INNER);
+            dit->vdn_gate_down = h3_gpu_tensor_new_bf16(
+                dit->gpu, inner_rows * HEAD_DIM);
+            dit->vdn_frame_mean = h3_gpu_tensor_new_f32(
+                dit->gpu, (size_t)inner_frames * HIDDEN);
+            dit->vdn_alpha_down = h3_gpu_tensor_new_f32(
+                dit->gpu, (size_t)inner_frames * HEAD_DIM);
+            dit->vdn_alpha = h3_gpu_tensor_new_f32(
+                dit->gpu, alpha_elements);
+            dit->vdn_a = h3_gpu_tensor_new_f32(dit->gpu, state_elements);
+            dit->vdn_b = h3_gpu_tensor_new_f32(dit->gpu, state_elements);
+            dit->vdn_rhs = h3_gpu_tensor_new_f32(
+                dit->gpu, state_elements * 2);
+            dit->vdn_solution = h3_gpu_tensor_new_f32(
+                dit->gpu, state_elements * 2);
+            dit->vdn_prefix = h3_gpu_tensor_new_f32(
+                dit->gpu, state_elements);
+            dit->vdn_suffix = h3_gpu_tensor_new_f32(
+                dit->gpu, state_elements);
+            if (h3_gpu_tensor_elements(dit->key) < state_elements)
+                dit->vdn_state = h3_gpu_tensor_new_bf16(
+                    dit->gpu, state_elements);
+            dit->vdn_projected = h3_gpu_tensor_new_bf16(
+                dit->gpu, inner_rows * HIDDEN);
+        }
+        dit->vdn_text_state = h3_gpu_tensor_new_f32(
+            dit->gpu, (size_t)HEADS * HEAD_DIM * HEAD_DIM);
+        float *ones = malloc((size_t)INNER * sizeof(*ones));
+        if (ones) for (size_t index = 0; index < INNER; index++)
+            ones[index] = 1.0f;
+        if (ones) dit->vdn_text_alpha = h3_gpu_tensor_from_f32(
+            dit->gpu, ones, INNER);
+        free(ones);
+        if (!dit->vdn_window_query || !dit->vdn_window_key ||
+            !dit->vdn_window_value || !dit->vdn_window_output ||
+            !dit->vdn_softmax_gate || !dit->vdn_text_state ||
+            !dit->vdn_text_alpha ||
+            (inner_frames && (!dit->vdn_video_hidden || !dit->vdn_feature ||
+             !dit->vdn_gate_down || !dit->vdn_frame_mean ||
+             !dit->vdn_alpha_down || !dit->vdn_alpha || !dit->vdn_a ||
+             !dit->vdn_b || !dit->vdn_rhs || !dit->vdn_solution ||
+             !dit->vdn_prefix || !dit->vdn_suffix ||
+             (h3_gpu_tensor_elements(dit->key) < state_elements &&
+              !dit->vdn_state) ||
+             !dit->vdn_projected))) {
+            fail(error, error_size, "cannot allocate VDN window attention: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -1558,6 +1764,7 @@ static void schedule_report(int completed, int total, void *opaque) {
 
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
+                        const char *vdn_checkpoint,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
@@ -1629,14 +1836,19 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    if (vdn_checkpoint) {
+        dit->vdn = h3_vdn_open(vdn_checkpoint, error, error_size);
+        if (!dit->vdn) goto failed;
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+    dit->int8_qkv = !dit->vdn && !dit->ssd_streaming &&
+                    !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
+    dit->int8_attention_out = !dit->vdn && !dit->ssd_streaming &&
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
@@ -1668,7 +1880,8 @@ static h3_dit *load_dit(const char *weight_directory,
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+        dit->weights, dit->vdn, dit->gpu, sigmas,
+        dit->video_condition_rows != 0,
         dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
     if (dit->schedule) {
@@ -1700,6 +1913,7 @@ failed:
 
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
+                         const char *vdn_checkpoint,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
@@ -1721,7 +1935,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_int8_row_fc2,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(weight_directory, shader_source_path, vdn_checkpoint,
+                    text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -1742,6 +1957,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
                          const char *shader_source_path,
+                         const char *vdn_checkpoint,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
@@ -1767,7 +1983,8 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(weight_directory, shader_source_path, vdn_checkpoint,
+                    text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -1873,6 +2090,320 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+static int vdn_copy_rows(h3_dit *dit, h3_gpu_tensor *destination,
+                         uint32_t destination_row,
+                         const h3_gpu_tensor *source, uint32_t source_row,
+                         uint32_t rows) {
+    return !rows || h3_gpu_copy_bf16(
+        dit->gpu, destination, (size_t)destination_row * INNER,
+        source, (size_t)source_row * INNER, (size_t)rows * INNER);
+}
+
+typedef struct {
+    uint32_t query_first;
+    uint32_t query_stop;
+    uint32_t window_first;
+    uint32_t window_stop;
+    uint32_t query_rows;
+    uint32_t kv_rows;
+} h3_vdn_window_plan;
+
+static h3_vdn_window_plan vdn_window_plan(const h3_dit *dit,
+                                          uint32_t chunk) {
+    uint32_t frame_rows = (uint32_t)dit->latent_h / 2 *
+                          ((uint32_t)dit->latent_w / 2);
+    uint32_t frames = (uint32_t)dit->latent_t;
+    uint32_t chunk_first = chunk * 5;
+    uint32_t chunk_stop = chunk_first + 5;
+    if (chunk_stop > frames) chunk_stop = frames;
+    h3_vdn_window_plan plan = {
+        .query_first = chunk_first < 1 ? 1 : chunk_first,
+        .query_stop = chunk_stop > frames - 1 ? frames - 1 : chunk_stop,
+        .window_first = chunk > 0 ? (chunk - 1) * 5 : 0,
+        .window_stop = (chunk + 2) * 5
+    };
+    if (plan.window_stop > frames) plan.window_stop = frames;
+    if (plan.query_first < plan.query_stop)
+        plan.query_rows = (plan.query_stop - plan.query_first) * frame_rows;
+    plan.kv_rows = dit->video_target_start +
+        (plan.window_stop - plan.window_first) * frame_rows;
+    if (plan.window_first != 0) plan.kv_rows += frame_rows;
+    if (plan.window_stop != frames) plan.kv_rows += frame_rows;
+    return plan;
+}
+
+static int vdn_pack_window_group(h3_dit *dit,
+                            const h3_vdn_window_plan *plan,
+                            uint32_t batch_index, uint32_t query_stride,
+                            uint32_t kv_stride) {
+    uint32_t frame_rows = (uint32_t)dit->latent_h / 2 *
+                          ((uint32_t)dit->latent_w / 2);
+    uint32_t frames = (uint32_t)dit->latent_t;
+    uint32_t query_base = batch_index * query_stride;
+    uint32_t kv_base = batch_index * kv_stride;
+    uint32_t kv_rows = kv_base;
+    if (!vdn_copy_rows(dit, dit->vdn_window_query, query_base, dit->query,
+                       dit->video_target_start +
+                           plan->query_first * frame_rows,
+                       plan->query_rows) ||
+        !vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key, 0,
+                       dit->video_target_start) ||
+        !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value, 0,
+                       dit->video_target_start)) return 0;
+    kv_rows += dit->video_target_start;
+    if (plan->window_first != 0) {
+        if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
+                           dit->video_target_start, frame_rows) ||
+            !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
+                           dit->video_target_start, frame_rows)) return 0;
+        kv_rows += frame_rows;
+    }
+    uint32_t window_rows = (plan->window_stop - plan->window_first) *
+                           frame_rows;
+    if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
+                       dit->video_target_start +
+                           plan->window_first * frame_rows,
+                       window_rows) ||
+        !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
+                       dit->video_target_start +
+                           plan->window_first * frame_rows,
+                       window_rows)) return 0;
+    kv_rows += window_rows;
+    if (plan->window_stop != frames) {
+        uint32_t last = dit->video_target_start + (frames - 1) * frame_rows;
+        if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
+                           last, frame_rows) ||
+            !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
+                           last, frame_rows)) return 0;
+        kv_rows += frame_rows;
+    }
+    return kv_rows - kv_base == plan->kv_rows;
+}
+
+static int run_vdn_softmax(h3_dit *dit, const h3_dit_block *weight,
+                           uint32_t rows, char *error, size_t error_size) {
+    uint32_t frames = (uint32_t)dit->latent_t;
+    uint32_t frame_rows = (uint32_t)dit->latent_h / 2 *
+                          ((uint32_t)dit->latent_w / 2);
+    uint32_t chunks = (frames + 4) / 5;
+    if (chunks <= 2) {
+        if (!h3_gpu_sdpa_bf16(
+                dit->gpu, dit->attention_heads, dit->query, dit->key,
+                dit->value, rows, HEADS, HEAD_DIM,
+                1.0f / sqrtf((float)HEAD_DIM))) goto failed;
+    } else {
+        uint32_t dense_rows = dit->video_target_start + frame_rows * 2;
+        if (!vdn_copy_rows(dit, dit->vdn_window_query, 0, dit->query, 0,
+                           dit->video_target_start) ||
+            !vdn_copy_rows(dit, dit->vdn_window_query,
+                           dit->video_target_start, dit->query,
+                           dit->video_target_start, frame_rows) ||
+            !vdn_copy_rows(dit, dit->vdn_window_query,
+                           dit->video_target_start + frame_rows, dit->query,
+                           dit->video_target_start + (frames - 1) * frame_rows,
+                           frame_rows) ||
+            dense_rows > dit->vdn_window_query_rows ||
+            !h3_gpu_cross_sdpa_bf16(
+                dit->gpu, dit->vdn_window_output, dit->vdn_window_query,
+                dit->key, dit->value, dense_rows, rows, HEADS, HEAD_DIM,
+                1.0f / sqrtf((float)HEAD_DIM)) ||
+            !vdn_copy_rows(dit, dit->attention_heads, 0,
+                           dit->vdn_window_output, 0,
+                           dit->video_target_start) ||
+            !vdn_copy_rows(dit, dit->attention_heads,
+                           dit->video_target_start, dit->vdn_window_output,
+                           dit->video_target_start, frame_rows) ||
+            !vdn_copy_rows(dit, dit->attention_heads,
+                           dit->video_target_start + (frames - 1) * frame_rows,
+                           dit->vdn_window_output,
+                           dit->video_target_start + frame_rows, frame_rows))
+            goto failed;
+        for (uint32_t chunk = 0; chunk < chunks;) {
+            h3_vdn_window_plan plans[VDN_WINDOW_BATCH_CAP];
+            plans[0] = vdn_window_plan(dit, chunk);
+            if (!plans[0].query_rows) {
+                chunk++;
+                continue;
+            }
+            uint32_t batch = 1;
+            while (batch < dit->vdn_window_batch &&
+                   chunk + batch < chunks) {
+                h3_vdn_window_plan next = vdn_window_plan(
+                    dit, chunk + batch);
+                if (next.query_rows != plans[0].query_rows ||
+                    next.kv_rows != plans[0].kv_rows) break;
+                plans[batch++] = next;
+            }
+            uint64_t query_rows = (uint64_t)batch * plans[0].query_rows;
+            uint64_t kv_rows = (uint64_t)batch * plans[0].kv_rows;
+            if (query_rows > dit->vdn_window_query_rows ||
+                kv_rows > dit->vdn_window_kv_rows) {
+                fail(error, error_size,
+                     "VDN window plan exceeds its activation arena");
+                return 0;
+            }
+            for (uint32_t index = 0; index < batch; index++)
+                if (!vdn_pack_window_group(
+                        dit, &plans[index], index, plans[0].query_rows,
+                        plans[0].kv_rows)) goto failed;
+            if (!h3_gpu_cross_sdpa_batched_bf16(
+                    dit->gpu, dit->vdn_window_output,
+                    dit->vdn_window_query, dit->vdn_window_key,
+                    dit->vdn_window_value, batch, plans[0].query_rows,
+                    plans[0].kv_rows, HEADS, HEAD_DIM,
+                    1.0f / sqrtf((float)HEAD_DIM))) goto failed;
+            for (uint32_t index = 0; index < batch; index++)
+                if (!vdn_copy_rows(
+                        dit, dit->attention_heads,
+                        dit->video_target_start +
+                            plans[index].query_first * frame_rows,
+                        dit->vdn_window_output,
+                        index * plans[0].query_rows,
+                        plans[index].query_rows)) goto failed;
+            chunk += batch;
+        }
+    }
+    if (!h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
+            weight->vdn.softmax_gate, weight->vdn.softmax_gate_bias,
+            rows, HIDDEN, HEADS) ||
+        !h3_gpu_vdn_gate_heads_bf16(
+            dit->gpu, dit->attention_heads, dit->vdn_softmax_gate,
+            rows, HEADS, HEAD_DIM)) goto failed;
+    return 1;
+failed:
+    fail(error, error_size, "VDN softmax branch: %s", h3_gpu_error(dit->gpu));
+    return 0;
+}
+
+static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
+                          uint32_t rows, char *error, size_t error_size) {
+    uint32_t frames = (uint32_t)dit->latent_t;
+    if (frames <= 2) return 1;
+    uint32_t inner_frames = frames - 2;
+    uint32_t grid_h = (uint32_t)dit->latent_h / 2;
+    uint32_t grid_w = (uint32_t)dit->latent_w / 2;
+    uint32_t frame_rows = grid_h * grid_w;
+    uint32_t inner_rows = inner_frames * frame_rows;
+    uint32_t inner_start = dit->video_target_start + frame_rows;
+    size_t state_elements = (size_t)inner_frames * HEADS *
+                            HEAD_DIM * HEAD_DIM;
+    size_t text_state_elements = (size_t)HEADS * HEAD_DIM * HEAD_DIM;
+#define VDN_OP(call, label) do {                                                \
+    if (!(call)) {                                                              \
+        fail(error, error_size, "%s: %s", label, h3_gpu_error(dit->gpu));      \
+        return 0;                                                               \
+    }                                                                           \
+} while (0)
+    /* The prompt is one delta-rule chunk and seeds both directional scans. */
+    VDN_OP(h3_gpu_vdn_text_features_bf16(
+        dit->gpu, dit->vdn_window_key, dit->vdn_window_value, dit->qkv,
+        0, dit->text_rows, HEADS, HEAD_DIM), "VDN text features");
+    VDN_OP(h3_gpu_linear_bf16(
+        dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
+        weight->vdn.beta, NULL, dit->text_rows, HIDDEN, HEADS),
+        "VDN text beta");
+    VDN_OP(h3_gpu_vdn_statistics_f32(
+        dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_window_key,
+        dit->vdn_window_value, dit->vdn_softmax_gate,
+        1, dit->text_rows, HEADS, HEAD_DIM), "VDN text statistics");
+    VDN_OP(h3_gpu_vdn_solve_f32(
+        dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
+        dit->vdn_solution, dit->vdn_text_alpha, 1, HEADS, HEAD_DIM),
+        "VDN text solve");
+    VDN_OP(h3_gpu_vdn_scale_f32(
+        dit->gpu, dit->vdn_text_state, dit->vdn_b,
+        (uint32_t)text_state_elements, 0.5f), "VDN text state");
+
+    VDN_OP(h3_gpu_copy_bf16(
+        dit->gpu, dit->vdn_video_hidden, 0, dit->mod_attention,
+        (size_t)inner_start * HIDDEN, (size_t)inner_rows * HIDDEN),
+        "VDN video hidden slice");
+    VDN_OP(h3_gpu_vdn_query_feature_bf16(
+        dit->gpu, dit->query, dit->qkv, inner_start, inner_frames,
+        frame_rows, HEADS, HEAD_DIM), "VDN query features");
+    VDN_OP(h3_gpu_vdn_spatial_feature_bf16(
+        dit->gpu, dit->key, dit->qkv, weight->vdn.k_spatial,
+        inner_start, inner_frames, grid_h, grid_w, HEADS, HEAD_DIM, 1),
+        "VDN key spatial convolution");
+    VDN_OP(h3_gpu_vdn_spatial_feature_bf16(
+        dit->gpu, dit->value, dit->qkv, weight->vdn.v_spatial,
+        inner_start, inner_frames, grid_h, grid_w, HEADS, HEAD_DIM, 2),
+        "VDN value spatial convolution");
+    VDN_OP(h3_gpu_vdn_temporal_feature_bf16(
+        dit->gpu, dit->vdn_feature, dit->key, weight->vdn.k_temporal,
+        inner_frames, frame_rows, HEADS, HEAD_DIM, 1),
+        "VDN key temporal convolution");
+    VDN_OP(h3_gpu_vdn_temporal_feature_bf16(
+        dit->gpu, dit->qkv, dit->value, weight->vdn.v_temporal,
+        inner_frames, frame_rows, HEADS, HEAD_DIM, 0),
+        "VDN value temporal convolution");
+    VDN_OP(h3_gpu_linear_bf16(
+        dit->gpu, dit->vdn_softmax_gate, dit->vdn_video_hidden,
+        weight->vdn.beta, NULL, inner_rows, HIDDEN, HEADS),
+        "VDN video beta");
+    VDN_OP(h3_gpu_vdn_statistics_f32(
+        dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_feature, dit->qkv,
+        dit->vdn_softmax_gate, inner_frames, frame_rows, HEADS, HEAD_DIM),
+        "VDN video statistics");
+    VDN_OP(h3_gpu_vdn_frame_mean_f32(
+        dit->gpu, dit->vdn_frame_mean, dit->vdn_video_hidden,
+        inner_frames, frame_rows, HIDDEN), "VDN frame mean");
+    VDN_OP(h3_gpu_vdn_linear_f32_bf16(
+        dit->gpu, dit->vdn_alpha_down, dit->vdn_frame_mean,
+        weight->vdn.alpha_down, inner_frames, HIDDEN, HEAD_DIM),
+        "VDN alpha down projection");
+    VDN_OP(h3_gpu_vdn_linear_f32_bf16(
+        dit->gpu, dit->vdn_alpha, dit->vdn_alpha_down,
+        weight->vdn.alpha_up, inner_frames, HEAD_DIM, INNER),
+        "VDN alpha up projection");
+    VDN_OP(h3_gpu_vdn_alpha_f32(
+        dit->gpu, dit->vdn_alpha, dit->vdn_alpha,
+        weight->vdn.alpha_dt_bias, weight->vdn.alpha_a_log,
+        inner_frames, HEADS, HEAD_DIM), "VDN alpha activation");
+    VDN_OP(h3_gpu_vdn_solve_f32(
+        dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
+        dit->vdn_solution, dit->vdn_alpha,
+        inner_frames, HEADS, HEAD_DIM), "VDN video solve");
+    VDN_OP(h3_gpu_vdn_scan_f32(
+        dit->gpu, dit->vdn_prefix, dit->vdn_suffix, dit->vdn_b,
+        dit->vdn_solution, dit->vdn_text_state,
+        inner_frames, HEADS, HEAD_DIM), "VDN bidirectional scans");
+    VDN_OP(h3_gpu_vdn_gather_state_bf16(
+        dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
+        dit->vdn_prefix, dit->vdn_suffix,
+        dit->vdn_alpha, dit->vdn_text_state,
+        inner_frames, HEADS, HEAD_DIM), "VDN complement state");
+    VDN_OP(h3_gpu_vdn_readout_bf16(
+        dit->gpu, dit->value, dit->query,
+        dit->vdn_state ? dit->vdn_state : dit->key,
+        inner_frames, frame_rows, HEADS, HEAD_DIM), "VDN state readout");
+    VDN_OP(h3_gpu_linear_bf16(
+        dit->gpu, dit->vdn_gate_down, dit->vdn_video_hidden,
+        weight->vdn.output_gate_down, NULL,
+        inner_rows, HIDDEN, HEAD_DIM), "VDN output gate down");
+    VDN_OP(h3_gpu_linear_bf16(
+        dit->gpu, dit->qkv, dit->vdn_gate_down,
+        weight->vdn.output_gate_up, weight->vdn.output_gate_up_bias,
+        inner_rows, HEAD_DIM, INNER), "VDN output gate up");
+    VDN_OP(h3_gpu_vdn_epilogue_bf16(
+        dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
+        inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
+        "VDN linear epilogue");
+    VDN_OP(h3_gpu_linear_bf16(
+        dit->gpu, dit->vdn_projected, dit->vdn_feature,
+        weight->vdn.output, NULL, inner_rows, INNER, HIDDEN),
+        "VDN linear output projection");
+    VDN_OP(h3_gpu_vdn_add_projected_bf16(
+        dit->gpu, dit->attention_output, inner_start,
+        dit->vdn_projected, inner_rows, HIDDEN),
+        "VDN branch fusion");
+    (void)rows;
+    (void)state_elements;
+#undef VDN_OP
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -1898,7 +2429,16 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (dit->vdn) {
+        OP(h3_gpu_linear_bf16(
+            dit->gpu, dit->qkv, dit->mod_attention, weight->qkv, NULL,
+            rows, HIDDEN, INNER * 3), "VDN raw QKV projection");
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+            "VDN QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -1923,7 +2463,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    if (dit->vdn) {
+        if (!run_vdn_softmax(dit, weight, rows, error, error_size)) return 0;
+    } else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -1952,6 +2494,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
+    if (dit->vdn &&
+        !run_vdn_linear(dit, weight, rows, error, error_size)) return 0;
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
@@ -3033,6 +3577,13 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
+    FREE(vdn_window_query); FREE(vdn_window_key); FREE(vdn_window_value);
+    FREE(vdn_window_output); FREE(vdn_softmax_gate);
+    FREE(vdn_video_hidden); FREE(vdn_feature); FREE(vdn_gate_down);
+    FREE(vdn_frame_mean); FREE(vdn_alpha_down); FREE(vdn_alpha);
+    FREE(vdn_a); FREE(vdn_b); FREE(vdn_rhs); FREE(vdn_solution);
+    FREE(vdn_text_alpha); FREE(vdn_text_state); FREE(vdn_prefix);
+    FREE(vdn_suffix); FREE(vdn_state); FREE(vdn_projected);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
@@ -3056,6 +3607,7 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
+    h3_vdn_free(dit->vdn);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
     free(dit);

@@ -8,6 +8,9 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef H3_BENCH_LATENT_T
+#define H3_BENCH_LATENT_T 7
+#endif
 #ifndef H3_BENCH_LATENT_H
 #define H3_BENCH_LATENT_H 32
 #endif
@@ -18,7 +21,7 @@
 enum {
     TEXT_ROWS = 6,
     TEXT_WIDTH = 5120,
-    LATENT_T = 7,
+    LATENT_T = H3_BENCH_LATENT_T,
     LATENT_H = H3_BENCH_LATENT_H,
     LATENT_W = H3_BENCH_LATENT_W,
     CANVAS_H = LATENT_H * 16,
@@ -1514,7 +1517,10 @@ int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
         "misc/fixtures/h3_real_prompt_bf16.safetensors";
-    uint16_t *text_values = load_text(prompt_fixture);
+    uint16_t *text_values = getenv("H3_BENCH_SYNTHETIC_TEXT") ?
+        calloc(TEXT_ROWS * TEXT_WIDTH, sizeof(*text_values)) :
+        load_text(prompt_fixture);
+    if (!text_values) die("out of memory allocating synthetic text");
     float *video = calloc(VIDEO_ELEMENTS, sizeof(*video));
     float *audio = calloc(AUDIO_ELEMENTS, sizeof(*audio));
     float *video_velocity = malloc(VIDEO_ELEMENTS * sizeof(*video_velocity));
@@ -1620,6 +1626,7 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_USE_SLOWER_GROUPED_QUANTIZER") != NULL;
     int ssd_streaming = getenv("H3_BENCH_SSD_STREAMING") != NULL;
     int all_bf16 = getenv("H3_BENCH_ALL_BF16") != NULL;
+    const char *vdn_checkpoint = getenv("H3_BENCH_VDN");
     h3_dit *dit;
     if (ref_layout) {
         size_t video_condition_elements =
@@ -1635,7 +1642,8 @@ int main(int argc, char **argv) {
         if (!video_condition || !audio_condition)
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
-            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            weights, "h3_shaders.metal", vdn_checkpoint,
+            &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
@@ -1646,7 +1654,8 @@ int main(int argc, char **argv) {
         free(audio_condition);
     } else {
         dit = h3_dit_load_t2va(
-            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            weights, "h3_shaders.metal", vdn_checkpoint,
+            &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,

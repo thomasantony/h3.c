@@ -56,6 +56,503 @@ struct int8_group_quant_args {
     uint groups;
 };
 
+struct lora_args {
+    uint base_rows;
+    uint columns;
+    uint output_offset;
+    uint output_rows;
+    uint rank;
+    float scale;
+};
+
+kernel void h3_lora_merge_bf16(device ushort *weight [[buffer(0)]],
+                                device const ushort *a [[buffer(1)]],
+                                device const ushort *b [[buffer(2)]],
+                                constant lora_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (column >= args.columns || row >= args.output_rows) return;
+    float delta = 0.0f;
+    for (uint k = 0; k < args.rank; k++)
+        delta = fma(h3_bf16_to_f32(b[row * args.rank + k]),
+                    h3_bf16_to_f32(a[k * args.columns + column]), delta);
+    uint index = (args.output_offset + row) * args.columns + column;
+    weight[index] = h3_f32_to_bf16(
+        h3_bf16_to_f32(weight[index]) + args.scale * delta);
+}
+
+struct lora_grouped_qkv_args {
+    uint columns;
+    uint heads;
+    uint head_dim;
+    uint stream;
+    uint rank;
+    float scale;
+};
+
+kernel void h3_lora_merge_grouped_qkv_bf16(
+                                device ushort *weight [[buffer(0)]],
+                                device const ushort *a [[buffer(1)]],
+                                device const ushort *b [[buffer(2)]],
+                                constant lora_grouped_qkv_args &args
+                                    [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    uint rows = args.heads * args.head_dim;
+    if (column >= args.columns || row >= rows) return;
+    float delta = 0.0f;
+    for (uint k = 0; k < args.rank; k++)
+        delta = fma(h3_bf16_to_f32(b[row * args.rank + k]),
+                    h3_bf16_to_f32(a[k * args.columns + column]), delta);
+    uint head = row / args.head_dim;
+    uint dimension = row - head * args.head_dim;
+    uint grouped_row = (head * 3 + args.stream) * args.head_dim + dimension;
+    uint index = grouped_row * args.columns + column;
+    weight[index] = h3_f32_to_bf16(
+        h3_bf16_to_f32(weight[index]) + args.scale * delta);
+}
+
+kernel void h3_lora_merge_swap_halves_bf16(
+                                device ushort *weight [[buffer(0)]],
+                                device const ushort *a [[buffer(1)]],
+                                device const ushort *b [[buffer(2)]],
+                                constant lora_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (column >= args.columns || row >= args.output_rows) return;
+    float delta = 0.0f;
+    for (uint k = 0; k < args.rank; k++)
+        delta = fma(h3_bf16_to_f32(b[row * args.rank + k]),
+                    h3_bf16_to_f32(a[k * args.columns + column]), delta);
+    uint half_rows = args.output_rows / 2;
+    uint destination_row = row < half_rows ? row + half_rows : row - half_rows;
+    uint index = destination_row * args.columns + column;
+    weight[index] = h3_f32_to_bf16(
+        h3_bf16_to_f32(weight[index]) + args.scale * delta);
+}
+
+struct vdn_gate_heads_args {
+    uint rows;
+    uint heads;
+    uint head_dim;
+};
+
+kernel void h3_vdn_gate_heads_bf16(
+                                device ushort *values [[buffer(0)]],
+                                device const ushort *logits [[buffer(1)]],
+                                constant vdn_gate_heads_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint inner = args.heads * args.head_dim;
+    uint count = args.rows * inner;
+    if (index >= count) return;
+    uint row = index / inner;
+    uint head = (index - row * inner) / args.head_dim;
+    float logit = h3_bf16_to_f32(logits[row * args.heads + head]);
+    float gate = 1.0f / (1.0f + exp(-logit));
+    values[index] = h3_f32_to_bf16(h3_bf16_to_f32(values[index]) * gate);
+}
+
+struct vdn_feature_args {
+    uint source_row;
+    uint frames;
+    uint tokens_per_frame;
+    uint height;
+    uint width;
+    uint heads;
+    uint head_dim;
+    uint stream;
+    uint l2_normalize;
+};
+
+inline float h3_vdn_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+inline uint h3_vdn_grouped_index(uint row, uint head, uint stream,
+                                  uint dimension, uint heads,
+                                  uint head_dim) {
+    return row * heads * head_dim * 3 +
+           (head * 3 + stream) * head_dim + dimension;
+}
+
+kernel void h3_vdn_text_features_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device ushort *key [[buffer(1)]],
+                                device ushort *value [[buffer(2)]],
+                                constant vdn_feature_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    if (row >= args.tokens_per_frame || head >= args.heads) return;
+    uint output = (row * args.heads + head) * args.head_dim;
+    float sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float k = h3_vdn_silu(h3_bf16_to_f32(qkv[
+            h3_vdn_grouped_index(args.source_row + row, head, 1, d,
+                                 args.heads, args.head_dim)]));
+        float v = h3_vdn_silu(h3_bf16_to_f32(qkv[
+            h3_vdn_grouped_index(args.source_row + row, head, 2, d,
+                                 args.heads, args.head_dim)]));
+        ushort kb = h3_f32_to_bf16(k);
+        key[output + d] = kb;
+        value[output + d] = h3_f32_to_bf16(v);
+        float rounded = h3_bf16_to_f32(kb);
+        sum = fma(rounded, rounded, sum);
+    }
+    float inverse = rsqrt(max(sum, 1.0e-24f));
+    for (uint d = 0; d < args.head_dim; d++)
+        key[output + d] = h3_f32_to_bf16(
+            h3_bf16_to_f32(key[output + d]) * inverse);
+}
+
+kernel void h3_vdn_query_feature_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device ushort *query [[buffer(1)]],
+                                constant vdn_feature_args &args [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint output = ((frame * args.heads + head) * args.tokens_per_frame + token) *
+                  args.head_dim;
+    float sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float q = h3_vdn_silu(h3_bf16_to_f32(qkv[
+            h3_vdn_grouped_index(args.source_row + row, head, 0, d,
+                                 args.heads, args.head_dim)]));
+        ushort qb = h3_f32_to_bf16(q);
+        query[output + d] = qb;
+        float rounded = h3_bf16_to_f32(qb);
+        sum = fma(rounded, rounded, sum);
+    }
+    float inverse = rsqrt(max(sum, 1.0e-24f));
+    for (uint d = 0; d < args.head_dim; d++)
+        query[output + d] = h3_f32_to_bf16(
+            h3_bf16_to_f32(query[output + d]) * inverse);
+}
+
+kernel void h3_vdn_spatial_feature_bf16(
+                                device const ushort *qkv [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device ushort *output [[buffer(2)]],
+                                constant vdn_feature_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint channels = args.heads * args.head_dim;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (index >= rows * channels) return;
+    uint channel = index % channels;
+    uint row = index / channels;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint y = token / args.width;
+    uint x = token - y * args.width;
+    uint head = channel / args.head_dim;
+    uint dimension = channel - head * args.head_dim;
+    float sum = 0.0f;
+    for (int ky = -2; ky <= 2; ky++) {
+        int sy = int(y) + ky;
+        if (sy < 0 || sy >= int(args.height)) continue;
+        for (int kx = -2; kx <= 2; kx++) {
+            int sx = int(x) + kx;
+            if (sx < 0 || sx >= int(args.width)) continue;
+            uint source_token = uint(sy) * args.width + uint(sx);
+            uint source = args.source_row +
+                frame * args.tokens_per_frame + source_token;
+            float v = h3_bf16_to_f32(qkv[h3_vdn_grouped_index(
+                source, head, args.stream, dimension,
+                args.heads, args.head_dim)]);
+            float w = h3_bf16_to_f32(
+                weight[channel * 25 + uint(ky + 2) * 5 + uint(kx + 2)]);
+            sum = fma(v, w, sum);
+        }
+    }
+    output[index] = h3_f32_to_bf16(sum);
+}
+
+kernel void h3_vdn_temporal_feature_bf16(
+                                device const ushort *spatial [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device ushort *output [[buffer(2)]],
+                                constant vdn_feature_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens_per_frame;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens_per_frame;
+    uint token = row - frame * args.tokens_per_frame;
+    uint base = (row * args.heads + head) * args.head_dim;
+    float sum_sq = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        uint channel = head * args.head_dim + d;
+        float sum = 0.0f;
+        for (int kt = -2; kt <= 2; kt++) {
+            int sf = int(frame) + kt;
+            if (sf < 0 || sf >= int(args.frames)) continue;
+            uint source_row = uint(sf) * args.tokens_per_frame + token;
+            float v = h3_bf16_to_f32(
+                spatial[(source_row * args.heads + head) * args.head_dim + d]);
+            float w = h3_bf16_to_f32(weight[channel * 5 + uint(kt + 2)]);
+            sum = fma(v, w, sum);
+        }
+        ushort feature = h3_f32_to_bf16(h3_vdn_silu(sum));
+        output[base + d] = feature;
+        float rounded = h3_bf16_to_f32(feature);
+        sum_sq = fma(rounded, rounded, sum_sq);
+    }
+    if (args.l2_normalize) {
+        float inverse = rsqrt(max(sum_sq, 1.0e-24f));
+        for (uint d = 0; d < args.head_dim; d++)
+            output[base + d] = h3_f32_to_bf16(
+                h3_bf16_to_f32(output[base + d]) * inverse);
+    }
+}
+
+struct vdn_mean_args { uint frames; uint tokens; uint width; };
+kernel void h3_vdn_frame_mean_f32(
+                                device const ushort *input [[buffer(0)]],
+                                device float *output [[buffer(1)]],
+                                constant vdn_mean_args &args [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint frame = gid.y;
+    if (column >= args.width || frame >= args.frames) return;
+    float sum = 0.0f;
+    uint base = frame * args.tokens * args.width + column;
+    for (uint token = 0; token < args.tokens; token++)
+        sum += h3_bf16_to_f32(input[base + token * args.width]);
+    output[frame * args.width + column] = sum / float(args.tokens);
+}
+
+struct vdn_linear_args { uint rows; uint input_dim; uint output_dim; };
+kernel void h3_vdn_linear_f32_bf16(
+                                device const float *input [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device float *output [[buffer(2)]],
+                                constant vdn_linear_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (column >= args.output_dim || row >= args.rows) return;
+    float sum = 0.0f;
+    for (uint k = 0; k < args.input_dim; k++)
+        sum = fma(input[row * args.input_dim + k],
+                  h3_bf16_to_f32(weight[column * args.input_dim + k]), sum);
+    output[row * args.output_dim + column] = sum;
+}
+
+struct vdn_alpha_args { uint frames; uint heads; uint head_dim; };
+kernel void h3_vdn_alpha_f32(
+                                device float *delta [[buffer(0)]],
+                                device const ushort *dt_bias [[buffer(1)]],
+                                device const ushort *a_log [[buffer(2)]],
+                                constant vdn_alpha_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint count = args.frames * args.heads * args.head_dim;
+    if (index >= count) return;
+    uint channel = index % (args.heads * args.head_dim);
+    uint head = channel / args.head_dim;
+    float x = delta[index] + h3_bf16_to_f32(dt_bias[channel]);
+    float softplus = x > 20.0f ? x :
+                     (x < -20.0f ? exp(x) : log(1.0f + exp(x)));
+    delta[index] = exp(-exp(h3_bf16_to_f32(a_log[head])) * softplus);
+}
+
+struct vdn_solve_args { uint batches; uint dim; };
+kernel void h3_vdn_cholesky_solve_f32(
+                                device float *a [[buffer(0)]],
+                                device float *rhs [[buffer(1)]],
+                                constant vdn_solve_args &args [[buffer(2)]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    uint batch = group.x;
+    if (batch >= args.batches || args.dim > 128) return;
+    uint d = args.dim;
+    uint matrix = batch * d * d;
+    uint right = batch * d * d;
+
+    for (uint index = tid; index < d * d; index += 128) {
+        uint row = index / d;
+        uint column = index - row * d;
+        a[matrix + index] = 0.5f * a[matrix + index] +
+                            (row == column ? 1.0f : 0.0f);
+    }
+    for (uint column = tid; column < d; column += 128)
+        for (uint row = 0; row < d; row++)
+            rhs[right + row * d + column] =
+                row == column ? 1.0f : 0.0f;
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // One threadgroup owns one SPD system. Columns are serial, while all rows
+    // below the pivot are updated in parallel. Keeping the factor in the
+    // existing fp32 A bank avoids a 64 KiB threadgroup-memory copy per system.
+    for (uint pivot = 0; pivot < d; pivot++) {
+        if (tid == 0) {
+            float diagonal = a[matrix + pivot * d + pivot];
+            for (uint k = 0; k < pivot; k++) {
+                float value = a[matrix + pivot * d + k];
+                diagonal -= value * value;
+            }
+            a[matrix + pivot * d + pivot] = sqrt(max(diagonal, 1.0e-20f));
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (tid > pivot && tid < d) {
+            float value = a[matrix + tid * d + pivot];
+            for (uint k = 0; k < pivot; k++)
+                value -= a[matrix + tid * d + k] *
+                         a[matrix + pivot * d + k];
+            a[matrix + tid * d + pivot] =
+                value / a[matrix + pivot * d + pivot];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // Form L^-1 with one triangular solve. Two tensor-core products outside
+    // this kernel then compute inv = L^-T L^-1 and B inv. This avoids the
+    // second triangular solve that dominates a direct cholesky_solve.
+    for (uint column = tid; column < d; column += 128) {
+        for (uint row = 0; row < d; row++) {
+            float value = rhs[right + row * d + column];
+            for (uint k = 0; k < row; k++)
+                value -= a[matrix + row * d + k] *
+                         rhs[right + k * d + column];
+            rhs[right + row * d + column] =
+                value / a[matrix + row * d + row];
+        }
+    }
+}
+
+kernel void h3_vdn_pack_solve_f32(
+                                device const float *solved [[buffer(0)]],
+                                device float *injection [[buffer(1)]],
+                                device float *transition [[buffer(2)]],
+                                device const float *alpha [[buffer(3)]],
+                                constant vdn_solve_args &args [[buffer(4)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint count = args.batches * matrix_size;
+    if (index >= count) return;
+    uint batch = index / matrix_size;
+    uint element = index - batch * matrix_size;
+    uint row = element / args.dim;
+    uint column = element - row * args.dim;
+    uint right = batch * matrix_size;
+    uint bank_size = args.batches * matrix_size;
+    transition[index] = solved[right + element] *
+                        alpha[batch * args.dim + row];
+    injection[index] = solved[bank_size + right + element];
+}
+
+struct vdn_scale_args { uint elements; float scale; };
+kernel void h3_vdn_scale_f32(device const float *input [[buffer(0)]],
+                             device float *output [[buffer(1)]],
+                             constant vdn_scale_args &args [[buffer(2)]],
+                             uint index [[thread_position_in_grid]]) {
+    if (index < args.elements) output[index] = input[index] * args.scale;
+}
+
+struct vdn_gather_args { uint frames; uint heads; uint dim; };
+kernel void h3_vdn_gather_state_bf16(
+                                device const float *prefix [[buffer(0)]],
+                                device const float *suffix [[buffer(1)]],
+                                device const float *alpha [[buffer(2)]],
+                                device const float *text [[buffer(3)]],
+                                device ushort *state [[buffer(4)]],
+                                constant vdn_gather_args &args [[buffer(5)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint count = args.frames * args.heads * matrix_size;
+    if (index >= count) return;
+    uint matrix_element = index % matrix_size;
+    uint matrix_index = index / matrix_size;
+    uint frame = matrix_index / args.heads;
+    uint head = matrix_index - frame * args.heads;
+    uint key_channel = matrix_element % args.dim;
+    uint original_frame = frame + 1;
+    int chunk = int(original_frame / 5);
+    int lo = (chunk - 1) * 5 - 1;
+    int hi = (chunk + 2) * 5 - 2;
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < int(args.frames);
+    uint before_frame = uint(clamp(last_before, 0, int(args.frames) - 1));
+    uint after_frame = uint(clamp(first_after, 0, int(args.frames) - 1));
+    uint local = head * matrix_size + matrix_element;
+    float before = has_before ?
+        prefix[before_frame * args.heads * matrix_size + local] : text[local];
+    float after = has_after ?
+        suffix[after_frame * args.heads * matrix_size + local] : text[local];
+    int bridge_before = max(last_before + 1, 0);
+    int bridge_after = min(first_after, int(args.frames));
+    // Match the checkpoint implementation's fp32 log-prefix bridge.  A direct
+    // product is mathematically equivalent, but its rounding error compounds
+    // across long clips and changes the retained far-state noticeably.
+    float before_log = 0.0f;
+    for (int f = bridge_before; f <= int(frame); f++)
+        before_log += log(max(alpha[(uint(f) * args.heads + head) * args.dim +
+                                   key_channel], 1.0e-12f));
+    float after_log = 0.0f;
+    for (int f = int(frame); f < bridge_after; f++)
+        after_log += log(max(alpha[(uint(f) * args.heads + head) * args.dim +
+                                  key_channel], 1.0e-12f));
+    float before_decay = exp(before_log);
+    float after_decay = exp(after_log);
+    state[index] = h3_f32_to_bf16(before * before_decay + after * after_decay);
+}
+
+struct vdn_epilogue_args {
+    uint frames; uint tokens; uint heads; uint dim; float epsilon;
+};
+kernel void h3_vdn_epilogue_bf16(
+                                device const ushort *readout [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device const ushort *gate [[buffer(2)]],
+                                device ushort *output [[buffer(3)]],
+                                constant vdn_epilogue_args &args [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    uint rows = args.frames * args.tokens;
+    if (row >= rows || head >= args.heads) return;
+    uint frame = row / args.tokens;
+    uint token = row - frame * args.tokens;
+    uint source = ((frame * args.heads + head) * args.tokens + token) * args.dim;
+    uint destination = (row * args.heads + head) * args.dim;
+    float sum = 0.0f;
+    for (uint d = 0; d < args.dim; d++) {
+        float value = h3_bf16_to_f32(readout[source + d]);
+        sum = fma(value, value, sum);
+    }
+    float inverse = rsqrt(sum / float(args.dim) + args.epsilon);
+    for (uint d = 0; d < args.dim; d++) {
+        float logit = h3_bf16_to_f32(gate[destination + d]);
+        float sigmoid = 1.0f / (1.0f + exp(-logit));
+        float value = h3_bf16_to_f32(readout[source + d]) * inverse *
+                      h3_bf16_to_f32(weight[d]) * sigmoid;
+        output[destination + d] = h3_f32_to_bf16(value);
+    }
+}
+
+struct vdn_add_args { uint destination_row; uint rows; uint width; };
+kernel void h3_vdn_add_projected_bf16(
+                                device ushort *destination [[buffer(0)]],
+                                device const ushort *source [[buffer(1)]],
+                                constant vdn_add_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint count = args.rows * args.width;
+    if (index >= count) return;
+    uint target = args.destination_row * args.width + index;
+    destination[target] = h3_f32_to_bf16(
+        h3_bf16_to_f32(destination[target]) + h3_bf16_to_f32(source[index]));
+}
+
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
                           device const float *weight [[buffer(1)]],
                           device const float *bias [[buffer(2)]],

@@ -2,6 +2,7 @@
 #include "h3_cli.h"
 #include "h3_host.h"
 #include "h3_terminal.h"
+#include "h3_vdn.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -19,6 +20,7 @@ static void usage(const char *program) {
         "       %s -d MODEL_DIR --info\n\n"
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
+        "      --vdn PATH         OpenVDN Stage B or Stage DMD checkpoint\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
@@ -27,7 +29,7 @@ static void usage(const char *program) {
         "      --render-height N  Lower internal model height (optional)\n"
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
-        "      --steps N          Denoising passes (default: 20)\n"
+        "      --steps N          Denoising passes (default: 20; VDN: checkpoint)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -235,6 +237,7 @@ int main(int argc, char **argv) {
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
            OPT_SSD_STREAMING,
+           OPT_VDN,
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
            OPT_USE_SLOWER_BF16_MLP,
@@ -268,6 +271,7 @@ int main(int argc, char **argv) {
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
+        {"vdn", required_argument, NULL, OPT_VDN},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -319,6 +323,7 @@ int main(int argc, char **argv) {
     int info = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int steps_given = 0;
     int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
@@ -343,7 +348,10 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                steps_given = 1;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -355,6 +363,7 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
+            case OPT_VDN: params.vdn_checkpoint = optarg; break;
             case OPT_USE_INT8_ROW_FC2:
                 params.use_int8_row_fc2 = 1;
                 break;
@@ -471,6 +480,18 @@ int main(int argc, char **argv) {
     if (frames_given && seconds_given) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
         return 2;
+    }
+    if (params.vdn_checkpoint && !steps_given) {
+        char vdn_error[256];
+        int recommended = h3_vdn_recommended_steps(
+            params.vdn_checkpoint, vdn_error, sizeof(vdn_error));
+        if (recommended < 0) {
+            fprintf(stderr, "h3: %s\n", vdn_error);
+            return 2;
+        }
+        params.steps = recommended;
+        fprintf(stderr, "h3: VDN checkpoint selects %d denoising steps\n",
+                recommended);
     }
     if (prompt && params.steps >= 2 && params.steps <= 7 &&
         params.denoise_reuse > 1) {

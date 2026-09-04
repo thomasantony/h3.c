@@ -62,6 +62,47 @@ h3> Make the person shown in Picture 1 wave to the camera.
 `!refs clear` removes them all. Ref2VA references cannot be mixed with
 `!first`/`!last` anchors.
 
+### Optional: run the VDN-H3 hybrid checkpoints
+
+The native Metal runtime can load the released OpenVDN Stage B (50-step) and
+Stage DMD (8-step) checkpoints directly. It reads the branch safetensors and
+merges their LoRA adapters into the MiniMax weights on the GPU; there is no
+Python conversion or Python inference process.
+
+Download the FL2VA base and both VDN releases:
+
+```sh
+hf download MiniMaxAI/MiniMax-H3 \
+  --local-dir MiniMax-H3 --include 'FL2VA/**'
+
+hf download OpenVDN/vdn-minimax-h3 \
+  --local-dir vdn-checkpoints --include 'stage-*/**'
+```
+
+Run the distilled Stage DMD checkpoint:
+
+```sh
+./h3 --profile \
+  -d ./MiniMax-H3 \
+  --vdn ./vdn-checkpoints/stage-dmd-step-250 \
+  -p "A red fox walks through fresh snow in a pine forest." \
+  --width 512 --height 512 --frames 56 \
+  --layers 50 --reuse 1 --core-reuse 1 \
+  -o outputs/fox-vdn-8-step.mp4
+```
+
+With no explicit `--steps`, the checkpoint metadata selects 8 denoising passes
+for Stage DMD and 50 for Stage B. To run the 50-step model, change `--vdn` to
+`./vdn-checkpoints/stage-b-step-2000`. An explicit `--steps N` always overrides
+the checkpoint recommendation.
+
+This first Metal port supports T2VA. VDN with `--first-frame`, `--last-frame`,
+or ordered Ref2VA inputs is rejected until the corresponding hybrid reference
+path is implemented. VDN also cannot be combined with `--token-reduction` or
+`--ssd-streaming`. The ordinary frame-count capability remains intact: the
+hybrid window planner accepts every frame count supported by h3.c, including a
+short final chunk in the five-frame window partition.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps

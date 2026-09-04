@@ -68,6 +68,9 @@ typedef struct {
     int frames;
     int steps;
     uint64_t seed;
+    /* Optional released OpenVDN checkpoint directory. The directory is read
+     * directly at load time; no Python conversion step is required. */
+    const char *vdn_checkpoint;
     const char *output_path;
     const char *first_frame;
     const char *last_frame;
@@ -130,7 +133,7 @@ typedef struct {
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
+    UINT64_C(42), NULL, NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
