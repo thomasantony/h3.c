@@ -2045,6 +2045,56 @@ kernel void h3_vdn_decay_vec4_f32(
     after[index] = exp(after_log);
 }
 
+/* Each five-frame VDN chunk shares one bridge range.  The generic decay
+ * kernel above recomputes the same log(alpha) values independently for every
+ * frame; this chunked form evaluates the forward and reverse ranges once per
+ * head/channel vector and emits all target frames from those running sums. */
+kernel void h3_vdn_decay_vec4_chunked_f32(
+                                device const float4 *alpha [[buffer(0)]],
+                                device float4 *before [[buffer(1)]],
+                                device float4 *after [[buffer(2)]],
+                                constant vdn_decay_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.dim / 4;
+    uint chunks = args.frames / 5 + 1;
+    uint chunk_stride = args.heads * vectors;
+    uint count = chunks * chunk_stride;
+    if (index >= count) return;
+    uint chunk = index / chunk_stride;
+    uint local = index - chunk * chunk_stride;
+    uint vector = local % vectors;
+    uint head = local / vectors;
+    uint frame_start = chunk == 0 ? 0 : chunk * 5 - 1;
+    uint frame_count = chunk == 0 ? 4 : 5;
+    uint frame_end = min(frame_start + frame_count, args.frames);
+    if (frame_start >= frame_end) return;
+    int bridge_before = max(int(chunk * 5) - 6, 0);
+    int bridge_after = min(int((chunk + 2) * 5 - 1),
+                           int(args.frames));
+    float4 before_values[5];
+    float4 after_values[5];
+    float4 before_log = 0.0f;
+    for (uint frame = (uint)bridge_before; frame < frame_end; frame++) {
+        float4 value = alpha[(frame * args.heads + head) * vectors + vector];
+        before_log += log(max(value, float4(1.0e-12f)));
+        if (frame >= frame_start)
+            before_values[frame - frame_start] = exp(before_log);
+    }
+    float4 after_log = 0.0f;
+    for (int frame = bridge_after - 1; frame >= int(frame_start); frame--) {
+        float4 value = alpha[(uint(frame) * args.heads + head) * vectors +
+                             vector];
+        after_log += log(max(value, float4(1.0e-12f)));
+        if (frame < int(frame_end))
+            after_values[uint(frame) - frame_start] = exp(after_log);
+    }
+    for (uint frame = frame_start; frame < frame_end; frame++) {
+        uint output = (frame * args.heads + head) * vectors + vector;
+        before[output] = before_values[frame - frame_start];
+        after[output] = after_values[frame - frame_start];
+    }
+}
+
 kernel void h3_vdn_gather_state_bf16(
                                 device const float *prefix [[buffer(0)]],
                                 device const float *suffix [[buffer(1)]],

@@ -487,7 +487,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_pack_scan_fp16", @"h3_vdn_pack_scan_fp16_vec4",
             @"h3_vdn_pack_state_fp16", @"h3_vdn_pack_state_fp16_vec4",
             @"h3_vdn_scale_f32", @"h3_vdn_decay_f32",
-            @"h3_vdn_decay_vec4_f32",
+            @"h3_vdn_decay_vec4_f32", @"h3_vdn_decay_vec4_chunked_f32",
             @"h3_vdn_gather_state_bf16",
             @"h3_vdn_gather_state_fp16", @"h3_vdn_gather_state_fp16_vec4",
             @"h3_vdn_gather_state_bf16_decay",
@@ -3439,6 +3439,24 @@ int h3_gpu_vdn_decay_f32(
     args_type args = {frames, heads, dim};
     int vec4 = dim % 4 == 0 &&
         !getenv("H3_DISABLE_VDN_DECAY_VEC4");
+    if (vec4 && getenv("H3_VDN_DECAY_CHUNKED")) {
+        size_t chunks = (size_t)frames / 5 + 1;
+        size_t vectors = dim / 4;
+        size_t dispatch_count = chunks * heads * vectors;
+        if (dispatch_count > UINT32_MAX) {
+            h3_gpu_set_error(gpu, @"VDN chunked decay dispatch is too large");
+            return 0;
+        }
+        return h3_gpu_dispatch_1d(
+            gpu, @"h3_vdn_decay_vec4_chunked_f32",
+            (uint32_t)dispatch_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(before_decay).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(after_decay).buffer offset:0 atIndex:2];
+                [encoder setBytes:&args length:sizeof(args) atIndex:3];
+            });
+    }
     size_t dispatch_count = vec4 ? count / 4 : count;
     return h3_gpu_dispatch_1d(gpu, vec4 ? @"h3_vdn_decay_vec4_f32" :
         @"h3_vdn_decay_f32", (uint32_t)dispatch_count,
