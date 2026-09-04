@@ -28,6 +28,83 @@ inline ushort4 h3_f32x4_to_bf16(float4 value) {
     return ushort4(bits >> 16);
 }
 
+struct h3_convert_16_args {
+    uint source_offset; uint destination_offset; uint vectors;
+};
+
+kernel void h3_copy_bf16_fp16_vec4(
+                                device const ushort4 *source [[buffer(0)]],
+                                device half4 *destination [[buffer(1)]],
+                                constant h3_convert_16_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index < args.vectors)
+        destination[args.destination_offset + index] =
+            half4(h3_bf16x4_to_f32(source[args.source_offset + index]));
+}
+
+kernel void h3_copy_fp16_bf16_vec4(
+                                device const half4 *source [[buffer(0)]],
+                                device ushort4 *destination [[buffer(1)]],
+                                constant h3_convert_16_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index < args.vectors)
+        destination[args.destination_offset + index] =
+            h3_f32x4_to_bf16(float4(source[args.source_offset + index]));
+}
+
+struct h3_attention_pack_args {
+    uint source_row; uint destination_batch; uint destination_row;
+    uint sequence; uint rows; uint heads; uint dim;
+};
+
+kernel void h3_pack_bf16_fp16_head_major(
+                                device const ushort4 *source [[buffer(0)]],
+                                device half4 *destination [[buffer(1)]],
+                                constant h3_attention_pack_args &args
+                                    [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.dim / 4;
+    uint count = args.rows * args.heads * vectors;
+    if (index >= count) return;
+    uint vector = index % vectors;
+    uint outer = index / vectors;
+    uint head = outer % args.heads;
+    uint row = outer / args.heads;
+    uint source_index = ((args.source_row + row) * args.heads + head) *
+                        vectors + vector;
+    uint destination_index =
+        ((args.destination_batch * args.heads + head) * args.sequence +
+         args.destination_row + row) * vectors + vector;
+    destination[destination_index] =
+        half4(h3_bf16x4_to_f32(source[source_index]));
+}
+
+kernel void h3_pack_bf16_fp16_head_major_pair(
+                                device const ushort4 *first_source [[buffer(0)]],
+                                device const ushort4 *second_source [[buffer(1)]],
+                                device half4 *first_destination [[buffer(2)]],
+                                device half4 *second_destination [[buffer(3)]],
+                                constant h3_attention_pack_args &args
+                                    [[buffer(4)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.dim / 4;
+    uint count = args.rows * args.heads * vectors;
+    if (index >= count) return;
+    uint vector = index % vectors;
+    uint outer = index / vectors;
+    uint head = outer % args.heads;
+    uint row = outer / args.heads;
+    uint source_index = ((args.source_row + row) * args.heads + head) *
+                        vectors + vector;
+    uint destination_index =
+        ((args.destination_batch * args.heads + head) * args.sequence +
+         args.destination_row + row) * vectors + vector;
+    first_destination[destination_index] =
+        half4(h3_bf16x4_to_f32(first_source[source_index]));
+    second_destination[destination_index] =
+        half4(h3_bf16x4_to_f32(second_source[source_index]));
+}
+
 struct linear_args {
     uint rows;
     uint input_dim;
@@ -153,6 +230,59 @@ kernel void h3_vdn_gate_heads_bf16(
     float logit = h3_bf16_to_f32(logits[row * args.heads + head]);
     float gate = 1.0f / (1.0f + exp(-logit));
     values[index] = h3_f32_to_bf16(h3_bf16_to_f32(values[index]) * gate);
+}
+
+struct vdn_copy_gate_args {
+    uint destination_row; uint source_row; uint logit_row;
+    uint rows; uint heads; uint head_dim;
+};
+
+kernel void h3_vdn_copy_gate_heads_bf16(
+                                device const ushort4 *source [[buffer(0)]],
+                                device ushort4 *destination [[buffer(1)]],
+                                device const ushort *logits [[buffer(2)]],
+                                constant vdn_copy_gate_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.head_dim / 4;
+    uint count = args.rows * args.heads * vectors;
+    if (index >= count) return;
+    uint outer = index / vectors;
+    uint head = outer % args.heads;
+    uint row = outer / args.heads;
+    float logit = h3_bf16_to_f32(
+        logits[(args.logit_row + row) * args.heads + head]);
+    float gate = 1.0f / (1.0f + exp(-logit));
+    uint source_index = ((args.source_row + row) * args.heads + head) *
+                        vectors + index % vectors;
+    uint destination_index =
+        ((args.destination_row + row) * args.heads + head) * vectors +
+        index % vectors;
+    destination[destination_index] = h3_f32x4_to_bf16(
+        h3_bf16x4_to_f32(source[source_index]) * gate);
+}
+
+kernel void h3_vdn_copy_gate_heads_fp16_bf16(
+                                device const half4 *source [[buffer(0)]],
+                                device ushort4 *destination [[buffer(1)]],
+                                device const ushort *logits [[buffer(2)]],
+                                constant vdn_copy_gate_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.head_dim / 4;
+    uint count = args.rows * args.heads * vectors;
+    if (index >= count) return;
+    uint outer = index / vectors;
+    uint head = outer % args.heads;
+    uint row = outer / args.heads;
+    float logit = h3_bf16_to_f32(
+        logits[(args.logit_row + row) * args.heads + head]);
+    float gate = 1.0f / (1.0f + exp(-logit));
+    uint source_index = ((args.source_row + row) * args.heads + head) *
+                        vectors + index % vectors;
+    uint destination_index =
+        ((args.destination_row + row) * args.heads + head) * vectors +
+        index % vectors;
+    destination[destination_index] = h3_f32x4_to_bf16(
+        float4(source[source_index]) * gate);
 }
 
 struct vdn_feature_args {
@@ -399,6 +529,64 @@ kernel void h3_vdn_temporal_feature_vec4_bf16(
             output4[d / 4] = h3_f32x4_to_bf16(
                 h3_bf16x4_to_f32(output4[d / 4]) * inverse);
     }
+}
+
+struct vdn_stats_pack_args {
+    uint frames; uint tokens; uint heads; uint dim; uint value_pass;
+};
+
+kernel void h3_vdn_pack_stats_fp16(
+                                device const ushort4 *key [[buffer(0)]],
+                                device const ushort4 *value [[buffer(1)]],
+                                device const ushort *beta [[buffer(2)]],
+                                device half4 *packed_key [[buffer(3)]],
+                                device half4 *packed_scaled [[buffer(4)]],
+                                constant vdn_stats_pack_args &args [[buffer(5)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors_per_head = args.dim / 4;
+    uint vectors_per_token = args.heads * vectors_per_head;
+    uint count = args.frames * args.tokens * vectors_per_token;
+    if (index >= count) return;
+    uint vector = index % vectors_per_head;
+    uint outer = index / vectors_per_head;
+    uint head = outer % args.heads;
+    uint token_frame = outer / args.heads;
+    uint token = token_frame % args.tokens;
+    uint frame = token_frame / args.tokens;
+    uint destination = ((frame * args.heads + head) * args.tokens + token) *
+                       vectors_per_head + vector;
+    float logit = h3_bf16_to_f32(
+        beta[(frame * args.tokens + token) * args.heads + head]);
+    float gate = 1.0f / (1.0f + exp(-logit));
+    if (!args.value_pass) {
+        float4 elements = h3_bf16x4_to_f32(key[index]);
+        packed_key[destination] = half4(elements);
+        packed_scaled[destination] = half4(elements * gate);
+    } else {
+        float4 elements = h3_bf16x4_to_f32(value[index]);
+        packed_scaled[destination] = half4(elements * gate);
+    }
+}
+
+struct vdn_stats_cast_args { uint batches; uint dim; uint symmetric; };
+kernel void h3_vdn_cast_stats_fp16_f32(
+                                device const half *input [[buffer(0)]],
+                                device float *output [[buffer(1)]],
+                                constant vdn_stats_cast_args &args [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint count = args.batches * matrix_size;
+    if (index >= count) return;
+    if (!args.symmetric) {
+        output[index] = float(input[index]);
+        return;
+    }
+    uint element = index % matrix_size;
+    uint matrix = index - element;
+    uint row = element / args.dim;
+    uint column = element - row * args.dim;
+    output[index] = float(input[index]) +
+                    float(input[matrix + column * args.dim + row]);
 }
 
 struct vdn_mean_args { uint frames; uint tokens; uint width; };
@@ -2975,6 +3163,7 @@ kernel void h3_linear_int8_nax_r128(
                            device const float *weight_scales [[buffer(3)]],
                            device bfloat *output [[buffer(4)]],
                            constant linear_args &args [[buffer(5)]],
+                           device const ushort *bias [[buffer(6)]],
                            uint code [[threadgroup_position_in_grid]]) {
     constexpr uint TILE = 128;
     uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
@@ -3012,10 +3201,65 @@ kernel void h3_linear_int8_nax_r128(
         auto index = accum.get_multidimensional_index(element);
         uint row = row_start + (uint)index[1];
         uint column = column_start + (uint)index[0];
-        if (row < args.rows)
-            output[row * args.output_dim + column] =
-                (bfloat)((float)accum[element] * input_scales[row] *
-                         weight_scales[column]);
+        if (row < args.rows) {
+            float value = (float)accum[element] * input_scales[row] *
+                          weight_scales[column];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            output[row * args.output_dim + column] = (bfloat)value;
+        }
+    }
+}
+
+/* VDN gate projections have 56 output channels. Pad the checkpoint rows to
+ * the 64-column TensorOps granularity, but write a compact 56-wide result. */
+kernel void h3_linear_int8_nax_r128x64_output56(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           device const ushort *bias [[buffer(6)]],
+                           uint row_tile [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint OUTPUT_DIM = 56;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_start = row_tile * ROW_TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)COLUMN_TILE));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, 128, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    auto first_a = x.slice<ROW_TILE, 128>(0, (int)row_start);
+    auto first_b = w.slice<128, COLUMN_TILE>(0, 0);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < args.input_dim; k += 128) {
+        auto a = x.slice<ROW_TILE, 128>((int)k, (int)row_start);
+        auto b = w.slice<128, COLUMN_TILE>((int)k, 0);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = (uint)index[0];
+        if (row < args.rows && column < OUTPUT_DIM) {
+            float value = (float)accum[element] * input_scales[row] *
+                          weight_scales[column];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            output[row * OUTPUT_DIM + column] = (bfloat)value;
+        }
     }
 }
 
@@ -3141,6 +3385,7 @@ kernel void h3_linear_int8_local_scales_nax_r128_impl(
                            device const float *weight_scales [[buffer(3)]],
                            device bfloat *output [[buffer(4)]],
                            constant linear_args &args [[buffer(5)]],
+                           device const ushort *bias [[buffer(6)]],
                            uint code [[threadgroup_position_in_grid]],
                            ushort tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
@@ -3197,11 +3442,13 @@ kernel void h3_linear_int8_local_scales_nax_r128_impl(
         auto index = accum.get_multidimensional_index(element);
         uint row = row_start + (uint)index[1];
         uint column = column_start + (uint)index[0];
-        if (row < args.rows)
-            output[row * output_dim + column] =
-                (bfloat)((float)accum[element] *
-                         local_input_scales[(uint)index[1]] *
-                         local_weight_scales[(uint)index[0]]);
+        if (row < args.rows) {
+            float value = (float)accum[element] *
+                          local_input_scales[(uint)index[1]] *
+                          local_weight_scales[(uint)index[0]];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            output[row * output_dim + column] = (bfloat)value;
+        }
     }
 }
 
@@ -3487,6 +3734,7 @@ kernel void h3_linear_int8_grouped_local_nax_r128x128(
         }
     }
 }
+
 #endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],

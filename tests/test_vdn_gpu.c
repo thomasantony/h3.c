@@ -219,6 +219,22 @@ static void test_statistics_solve_scan(test_context *test) {
     compare_f32(a, expected_a, MATRICES, 0.005f, "statistics A");
     compare_f32(b, expected_b, MATRICES, 0.012f, "statistics B");
 
+    h3_gpu_tensor *a_fp16 = fresh_f32(test, MATRICES);
+    h3_gpu_tensor *b_fp16 = fresh_f32(test, MATRICES);
+    h3_gpu_tensor *packed_key = fresh_bf16(test, FEATURES);
+    h3_gpu_tensor *packed_scaled = fresh_bf16(test, FEATURES);
+    h3_gpu_tensor *product = fresh_bf16(test, MATRICES);
+    gpu_ok(test, h3_gpu_begin(test->gpu), "begin FP16 statistics");
+    gpu_ok(test, h3_gpu_vdn_statistics_fp16(
+                     test->gpu, a_fp16, b_fp16, key, value, beta,
+                     packed_key, packed_scaled, product,
+                     FRAMES, TOKENS, HEADS, DIM), "FP16 frame statistics");
+    gpu_ok(test, h3_gpu_submit(test->gpu), "submit FP16 statistics");
+    compare_f32(a_fp16, expected_a, MATRICES, 0.006f,
+                "FP16 statistics A");
+    compare_f32(b_fp16, expected_b, MATRICES, 0.015f,
+                "FP16 statistics B");
+
     float source_a[MATRICES], source_b[MATRICES];
     read_f32(a, source_a, MATRICES);
     read_f32(b, source_b, MATRICES);
@@ -458,6 +474,44 @@ static void test_readout_and_lora(test_context *test) {
                      FRAMES, TOKENS, HEADS, DIM), "state readout");
     gpu_ok(test, h3_gpu_submit(test->gpu), "submit readout");
     compare_bf16(output, expected, FEATURES, 0.01f, "BF16 readout");
+
+    enum { GATE_ROWS = 2, GATE_HEADS = 2, GATE_DIM = 4,
+           GATE_INNER = GATE_HEADS * GATE_DIM };
+    float gate_source[3 * GATE_INNER];
+    float gate_destination[4 * GATE_INNER] = {0};
+    float gate_logits[4 * GATE_HEADS];
+    float expected_gate[4 * GATE_INNER] = {0};
+    for (int index = 0; index < 3 * GATE_INNER; index++)
+        gate_source[index] = 0.125f * (float)(index - 7);
+    for (int index = 0; index < 4 * GATE_HEADS; index++)
+        gate_logits[index] = 0.4f * (float)(index - 3);
+    for (int row = 0; row < GATE_ROWS; row++)
+        for (int head = 0; head < GATE_HEADS; head++) {
+            float logit = round_bf16(
+                gate_logits[(row + 2) * GATE_HEADS + head]);
+            float gate = 1.0f / (1.0f + expf(-logit));
+            for (int dim = 0; dim < GATE_DIM; dim++)
+                expected_gate[((row + 1) * GATE_HEADS + head) * GATE_DIM +
+                              dim] =
+                    round_bf16(gate_source[
+                        ((row + 1) * GATE_HEADS + head) * GATE_DIM + dim]) *
+                    gate;
+        }
+    h3_gpu_tensor *gate_source_tensor = upload_bf16(
+        test, gate_source, 3 * GATE_INNER);
+    h3_gpu_tensor *gate_destination_tensor = upload_bf16(
+        test, gate_destination, 4 * GATE_INNER);
+    h3_gpu_tensor *gate_logits_tensor = upload_bf16(
+        test, gate_logits, 4 * GATE_HEADS);
+    gpu_ok(test, h3_gpu_begin(test->gpu), "begin fused gated copy");
+    gpu_ok(test, h3_gpu_vdn_copy_gate_heads_bf16(
+                     test->gpu, gate_destination_tensor, 1,
+                     gate_source_tensor, 1, gate_logits_tensor, 2,
+                     GATE_ROWS, GATE_HEADS, GATE_DIM, 0),
+           "fused gated copy");
+    gpu_ok(test, h3_gpu_submit(test->gpu), "submit fused gated copy");
+    compare_bf16(gate_destination_tensor, expected_gate, 4 * GATE_INNER,
+                 0.01f, "fused gated copy");
 
     enum { COLUMNS = 2, QKV_HEADS = 2, QKV_DIM = 2,
            QKV_ROWS = QKV_HEADS * QKV_DIM * 3 };

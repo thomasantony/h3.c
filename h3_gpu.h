@@ -132,6 +132,33 @@ int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
                      size_t elements);
+/* The destination/source retain 16-bit storage; these convert the bit encoding
+ * for FP16 MPS kernels without allocating another activation arena. */
+int h3_gpu_copy_bf16_fp16(h3_gpu *gpu, h3_gpu_tensor *destination,
+                          size_t destination_offset,
+                          const h3_gpu_tensor *source, size_t source_offset,
+                          size_t elements);
+int h3_gpu_copy_fp16_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
+                          size_t destination_offset,
+                          const h3_gpu_tensor *source, size_t source_offset,
+                          size_t elements);
+/* Convert row-major BF16 [row, head, dim] slices into batched, head-major
+ * FP16 storage [batch, head, sequence, dim] for direct attention kernels. */
+int h3_gpu_pack_bf16_fp16_head_major(
+                          h3_gpu *gpu, h3_gpu_tensor *destination,
+                          const h3_gpu_tensor *source, uint32_t source_row,
+                          uint32_t destination_batch,
+                          uint32_t destination_row, uint32_t sequence,
+                          uint32_t rows, uint32_t heads, uint32_t head_dim);
+int h3_gpu_pack_bf16_fp16_head_major_pair(
+                          h3_gpu *gpu,
+                          h3_gpu_tensor *first_destination,
+                          h3_gpu_tensor *second_destination,
+                          const h3_gpu_tensor *first_source,
+                          const h3_gpu_tensor *second_source,
+                          uint32_t source_row, uint32_t destination_batch,
+                          uint32_t destination_row, uint32_t sequence,
+                          uint32_t rows, uint32_t heads, uint32_t head_dim);
 int h3_gpu_copy_f32(h3_gpu *gpu, h3_gpu_tensor *destination,
                     size_t destination_offset,
                     const h3_gpu_tensor *source, size_t source_offset,
@@ -346,12 +373,45 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+int h3_gpu_quantize_weight_int8_padded(h3_gpu *gpu,
+                                h3_gpu_tensor *output,
+                                h3_gpu_tensor *scales,
+                                const h3_gpu_tensor *input, uint32_t rows,
+                                uint32_t padded_rows, uint32_t columns);
+int h3_gpu_linear_int8_56_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            const h3_gpu_tensor *bias,
+                            uint32_t rows, uint32_t input_dim,
+                            int input_is_quantized);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
                             const h3_gpu_tensor *input,
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim,
+                            int use_slower_uncached_int8_scales);
+int h3_gpu_linear_int8_prequantized_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim,
+                            int use_slower_uncached_int8_scales);
+int h3_gpu_linear_int8_bias_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            const h3_gpu_tensor *bias,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
@@ -540,9 +600,30 @@ int h3_gpu_cross_sdpa_batched_bf16(
                      const h3_gpu_tensor *value, uint32_t batch,
                      uint32_t query_sequence, uint32_t kv_sequence,
                      uint32_t heads, uint32_t head_dim, float scale);
+/* Inputs/output use the same 16-bit arenas but contain IEEE FP16 bit patterns. */
+int h3_gpu_cross_sdpa_batched_fp16_storage(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t batch,
+                     uint32_t query_sequence, uint32_t kv_sequence,
+                     uint32_t heads, uint32_t head_dim, float scale);
+/* Head-major IEEE FP16 inputs; the graph casts its row-major output to BF16. */
+int h3_gpu_cross_sdpa_batched_fp16_head_major_storage(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t batch,
+                     uint32_t query_sequence, uint32_t kv_sequence,
+                     uint32_t heads, uint32_t head_dim, float scale);
 int h3_gpu_vdn_gate_heads_bf16(h3_gpu *gpu, h3_gpu_tensor *heads,
                      const h3_gpu_tensor *logits, uint32_t rows,
                      uint32_t head_count, uint32_t head_dim);
+int h3_gpu_vdn_copy_gate_heads_bf16(
+                     h3_gpu *gpu, h3_gpu_tensor *destination,
+                     uint32_t destination_row,
+                     const h3_gpu_tensor *source, uint32_t source_row,
+                     const h3_gpu_tensor *logits, uint32_t logit_row,
+                     uint32_t rows, uint32_t head_count, uint32_t head_dim,
+                     int source_is_fp16);
 int h3_gpu_vdn_text_features_bf16(
                      h3_gpu *gpu, h3_gpu_tensor *key,
                      h3_gpu_tensor *value, const h3_gpu_tensor *grouped_qkv,
@@ -587,6 +668,16 @@ int h3_gpu_vdn_statistics_f32(
                      const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value,
                      const h3_gpu_tensor *beta_logits,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim);
+int h3_gpu_vdn_statistics_fp16(
+                     h3_gpu *gpu, h3_gpu_tensor *a, h3_gpu_tensor *b,
+                     const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value,
+                     const h3_gpu_tensor *beta_logits,
+                     h3_gpu_tensor *packed_key,
+                     h3_gpu_tensor *packed_scaled,
+                     h3_gpu_tensor *product,
                      uint32_t frames, uint32_t tokens_per_frame,
                      uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_solve_f32(

@@ -121,6 +121,26 @@ reduction uses the existing gate-ranked block policy and is a quality/speed
 tradeoff; keep 35 or more active blocks when matching the previous output is
 more important than reaching the sub-30-second target.
 
+An aggressive VDN path additionally quantizes the branch projections, forms
+the delta statistics in FP16, and feeds head-major FP16 windows directly to
+MPS attention. Enable it together with row-scaled FC2 as follows:
+
+```sh
+H3_VDN_INT8_ATTENTION_OUT=1 \
+H3_VDN_FP16_STATS=1 \
+H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
+./h3 --use-int8-row-fc2 --profile \
+  -d ./MiniMax-H3 \
+  --vdn ./vdn-checkpoints/stage-dmd-step-250 \
+  -p "A red fox walks through fresh snow in a pine forest." \
+  --width 512 --height 512 --frames 56 --layers 35 \
+  -o outputs/fox-vdn-fast.mp4
+```
+
+The same 35-block core benchmark completed in 26.71 seconds with this preset,
+36% below the original 41.73 seconds. Its FP16 and int8 rounding changes output
+bytes, so use the preceding BF16 path when numerical closeness is the priority.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps

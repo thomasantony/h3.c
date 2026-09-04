@@ -15,17 +15,27 @@ typedef struct {
     h3_gpu_tensor *alpha_dt_bias;
     h3_gpu_tensor *alpha_up;
     h3_gpu_tensor *beta;
+    h3_gpu_tensor *beta_int8;
+    h3_gpu_tensor *beta_scales;
     h3_gpu_tensor *norm;
     h3_gpu_tensor *output_gate_down;
+    h3_gpu_tensor *output_gate_down_int8;
+    h3_gpu_tensor *output_gate_down_scales;
     h3_gpu_tensor *output_gate_up_bias;
     h3_gpu_tensor *output_gate_up;
+    h3_gpu_tensor *output_gate_up_int8;
+    h3_gpu_tensor *output_gate_up_scales;
     h3_gpu_tensor *k_spatial;
     h3_gpu_tensor *k_temporal;
     h3_gpu_tensor *v_spatial;
     h3_gpu_tensor *v_temporal;
     h3_gpu_tensor *softmax_gate_bias;
     h3_gpu_tensor *softmax_gate;
+    h3_gpu_tensor *softmax_gate_int8;
+    h3_gpu_tensor *softmax_gate_scales;
     h3_gpu_tensor *output;
+    h3_gpu_tensor *output_int8;
+    h3_gpu_tensor *output_scales;
 } h3_vdn_block;
 
 /* Open one released OpenVDN exploded checkpoint (Stage B or Stage DMD).

@@ -263,6 +263,52 @@ int h3_vdn_load_block(const h3_vdn *vdn, h3_gpu *gpu, unsigned block,
     LOAD(softmax_gate, "softmax_gate.up.weight", 2, beta);
     LOAD(output, "to_out_linear.weight", 2, output);
 #undef LOAD
+    if (h3_gpu_has_int8_mlp(gpu) && !getenv("H3_DISABLE_VDN_INT8")) {
+        weights->output_gate_down_int8 = h3_gpu_tensor_new_i8(
+            gpu, (size_t)128 * 5376);
+        weights->output_gate_down_scales = h3_gpu_tensor_new_f32(gpu, 128);
+        weights->output_gate_up_int8 = h3_gpu_tensor_new_i8(
+            gpu, (size_t)7168 * 128);
+        weights->output_gate_up_scales = h3_gpu_tensor_new_f32(gpu, 7168);
+        weights->output_int8 = h3_gpu_tensor_new_i8(
+            gpu, (size_t)5376 * 7168);
+        weights->output_scales = h3_gpu_tensor_new_f32(gpu, 5376);
+        weights->beta_int8 = h3_gpu_tensor_new_i8(gpu, (size_t)64 * 5376);
+        weights->beta_scales = h3_gpu_tensor_new_f32(gpu, 64);
+        weights->softmax_gate_int8 = h3_gpu_tensor_new_i8(
+            gpu, (size_t)64 * 5376);
+        weights->softmax_gate_scales = h3_gpu_tensor_new_f32(gpu, 64);
+        int ok = weights->beta_int8 && weights->beta_scales &&
+            weights->softmax_gate_int8 && weights->softmax_gate_scales &&
+            weights->output_gate_down_int8 &&
+            weights->output_gate_down_scales && weights->output_gate_up_int8 &&
+            weights->output_gate_up_scales && weights->output_int8 &&
+            weights->output_scales && h3_gpu_begin(gpu);
+        if (ok) ok = h3_gpu_quantize_weight_int8_padded(
+            gpu, weights->beta_int8, weights->beta_scales, weights->beta,
+            56, 64, 5376);
+        if (ok) ok = h3_gpu_quantize_weight_int8_padded(
+            gpu, weights->softmax_gate_int8, weights->softmax_gate_scales,
+            weights->softmax_gate, 56, 64, 5376);
+        if (ok) ok = h3_gpu_quantize_weight_int8(
+            gpu, weights->output_gate_down_int8,
+            weights->output_gate_down_scales, weights->output_gate_down,
+            128, 5376);
+        if (ok) ok = h3_gpu_quantize_weight_int8(
+            gpu, weights->output_gate_up_int8,
+            weights->output_gate_up_scales, weights->output_gate_up,
+            7168, 128);
+        if (ok) ok = h3_gpu_quantize_weight_int8(
+            gpu, weights->output_int8, weights->output_scales,
+            weights->output, 5376, 7168);
+        if (ok) ok = h3_gpu_submit(gpu);
+        if (!ok) {
+            if (!error || !error_size || !error[0])
+                fail(error, error_size, "cannot quantize VDN projections: %s",
+                     h3_gpu_error(gpu));
+            goto failed;
+        }
+    }
     return 1;
 failed:
 #undef LOAD
@@ -281,17 +327,27 @@ void h3_vdn_free_block(h3_vdn_block *weights) {
     FREE(alpha_dt_bias);
     FREE(alpha_up);
     FREE(beta);
+    FREE(beta_int8);
+    FREE(beta_scales);
     FREE(norm);
     FREE(output_gate_down);
+    FREE(output_gate_down_int8);
+    FREE(output_gate_down_scales);
     FREE(output_gate_up_bias);
     FREE(output_gate_up);
+    FREE(output_gate_up_int8);
+    FREE(output_gate_up_scales);
     FREE(k_spatial);
     FREE(k_temporal);
     FREE(v_spatial);
     FREE(v_temporal);
     FREE(softmax_gate_bias);
     FREE(softmax_gate);
+    FREE(softmax_gate_int8);
+    FREE(softmax_gate_scales);
     FREE(output);
+    FREE(output_int8);
+    FREE(output_scales);
 #undef FREE
 }
 

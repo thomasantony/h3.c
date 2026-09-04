@@ -1857,8 +1857,9 @@ static h3_dit *load_dit(const char *weight_directory,
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               (!dit->vdn ||
-                               dit->sequence <=
-                                   VDN_INT8_ATTENTION_OUT_MAX_ROWS) &&
+                               (dit->sequence <=
+                                    VDN_INT8_ATTENTION_OUT_MAX_ROWS ||
+                                getenv("H3_VDN_INT8_ATTENTION_OUT"))) &&
                               h3_gpu_has_int8_mlp(dit->gpu);
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
@@ -2107,6 +2108,56 @@ static int vdn_copy_rows(h3_dit *dit, h3_gpu_tensor *destination,
         source, (size_t)source_row * INNER, (size_t)rows * INNER);
 }
 
+static int vdn_pack_local_rows(h3_dit *dit, h3_gpu_tensor *destination,
+                               uint32_t destination_row,
+                               const h3_gpu_tensor *source,
+                               uint32_t source_row, uint32_t rows) {
+    if (!rows) return 1;
+    if (!getenv("H3_VDN_FP16_SDPA"))
+        return vdn_copy_rows(dit, destination, destination_row,
+                             source, source_row, rows);
+    return h3_gpu_copy_bf16_fp16(
+        dit->gpu, destination, (size_t)destination_row * INNER,
+        source, (size_t)source_row * INNER, (size_t)rows * INNER);
+}
+
+static int vdn_pack_window_rows(h3_dit *dit,
+                                h3_gpu_tensor *destination,
+                                uint32_t flat_destination_row,
+                                uint32_t destination_batch,
+                                uint32_t destination_row,
+                                uint32_t sequence,
+                                const h3_gpu_tensor *source,
+                                uint32_t source_row, uint32_t rows,
+                                int head_major_storage) {
+    if (!head_major_storage)
+        return vdn_pack_local_rows(dit, destination, flat_destination_row,
+                                   source, source_row, rows);
+    return h3_gpu_pack_bf16_fp16_head_major(
+        dit->gpu, destination, source, source_row, destination_batch,
+        destination_row, sequence, rows, HEADS, HEAD_DIM);
+}
+
+static int vdn_pack_window_pair(h3_dit *dit,
+                                uint32_t flat_destination_row,
+                                uint32_t destination_batch,
+                                uint32_t destination_row,
+                                uint32_t sequence,
+                                uint32_t source_row, uint32_t rows,
+                                int head_major_storage) {
+    if (!head_major_storage)
+        return vdn_pack_local_rows(
+                   dit, dit->vdn_window_key, flat_destination_row,
+                   dit->key, source_row, rows) &&
+               vdn_pack_local_rows(
+                   dit, dit->vdn_window_value, flat_destination_row,
+                   dit->value, source_row, rows);
+    return h3_gpu_pack_bf16_fp16_head_major_pair(
+        dit->gpu, dit->vdn_window_key, dit->vdn_window_value,
+        dit->key, dit->value, source_row, destination_batch,
+        destination_row, sequence, rows, HEADS, HEAD_DIM);
+}
+
 typedef struct {
     uint32_t query_first;
     uint32_t query_stop;
@@ -2143,46 +2194,41 @@ static h3_vdn_window_plan vdn_window_plan(const h3_dit *dit,
 static int vdn_pack_window_group(h3_dit *dit,
                             const h3_vdn_window_plan *plan,
                             uint32_t batch_index, uint32_t query_stride,
-                            uint32_t kv_stride) {
+                            uint32_t kv_stride, int head_major_storage) {
     uint32_t frame_rows = (uint32_t)dit->latent_h / 2 *
                           ((uint32_t)dit->latent_w / 2);
     uint32_t frames = (uint32_t)dit->latent_t;
     uint32_t query_base = batch_index * query_stride;
     uint32_t kv_base = batch_index * kv_stride;
     uint32_t kv_rows = kv_base;
-    if (!vdn_copy_rows(dit, dit->vdn_window_query, query_base, dit->query,
-                       dit->video_target_start +
-                           plan->query_first * frame_rows,
-                       plan->query_rows) ||
-        !vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key, 0,
-                       dit->video_target_start) ||
-        !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value, 0,
-                       dit->video_target_start)) return 0;
+    if (!vdn_pack_window_rows(
+            dit, dit->vdn_window_query, query_base, batch_index, 0,
+            query_stride, dit->query, dit->video_target_start +
+                plan->query_first * frame_rows, plan->query_rows,
+            head_major_storage) ||
+        !vdn_pack_window_pair(
+            dit, kv_rows, batch_index, 0, kv_stride, 0,
+            dit->video_target_start, head_major_storage)) return 0;
     kv_rows += dit->video_target_start;
     if (plan->window_first != 0) {
-        if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
-                           dit->video_target_start, frame_rows) ||
-            !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
-                           dit->video_target_start, frame_rows)) return 0;
+        if (!vdn_pack_window_pair(
+                dit, kv_rows, batch_index, kv_rows - kv_base, kv_stride,
+                dit->video_target_start, frame_rows,
+                head_major_storage)) return 0;
         kv_rows += frame_rows;
     }
     uint32_t window_rows = (plan->window_stop - plan->window_first) *
                            frame_rows;
-    if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
-                       dit->video_target_start +
-                           plan->window_first * frame_rows,
-                       window_rows) ||
-        !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
-                       dit->video_target_start +
-                           plan->window_first * frame_rows,
-                       window_rows)) return 0;
+    if (!vdn_pack_window_pair(
+            dit, kv_rows, batch_index, kv_rows - kv_base, kv_stride,
+            dit->video_target_start + plan->window_first * frame_rows,
+            window_rows, head_major_storage)) return 0;
     kv_rows += window_rows;
     if (plan->window_stop != frames) {
         uint32_t last = dit->video_target_start + (frames - 1) * frame_rows;
-        if (!vdn_copy_rows(dit, dit->vdn_window_key, kv_rows, dit->key,
-                           last, frame_rows) ||
-            !vdn_copy_rows(dit, dit->vdn_window_value, kv_rows, dit->value,
-                           last, frame_rows)) return 0;
+        if (!vdn_pack_window_pair(
+                dit, kv_rows, batch_index, kv_rows - kv_base, kv_stride,
+                last, frame_rows, head_major_storage)) return 0;
         kv_rows += frame_rows;
     }
     return kv_rows - kv_base == plan->kv_rows;
@@ -2194,11 +2240,27 @@ static int run_vdn_softmax(h3_dit *dit, const h3_dit_block *weight,
     uint32_t frame_rows = (uint32_t)dit->latent_h / 2 *
                           ((uint32_t)dit->latent_w / 2);
     uint32_t chunks = (frames + 4) / 5;
+    int gate_ok = weight->vdn.softmax_gate_int8 ?
+        h3_gpu_linear_int8_56_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_attention,
+            weight->vdn.softmax_gate_int8,
+            weight->vdn.softmax_gate_scales,
+            weight->vdn.softmax_gate_bias, rows, HIDDEN,
+            dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) :
+        h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
+            weight->vdn.softmax_gate, weight->vdn.softmax_gate_bias,
+            rows, HIDDEN, HEADS);
+    if (!gate_ok) goto failed;
     if (chunks <= 2) {
         if (!h3_gpu_sdpa_bf16(
                 dit->gpu, dit->attention_heads, dit->query, dit->key,
                 dit->value, rows, HEADS, HEAD_DIM,
-                1.0f / sqrtf((float)HEAD_DIM))) goto failed;
+                1.0f / sqrtf((float)HEAD_DIM)) ||
+            !h3_gpu_vdn_gate_heads_bf16(
+                dit->gpu, dit->attention_heads, dit->vdn_softmax_gate,
+                rows, HEADS, HEAD_DIM)) goto failed;
     } else {
         uint32_t dense_rows = dit->video_target_start + frame_rows * 2;
         if (!vdn_copy_rows(dit, dit->vdn_window_query, 0, dit->query, 0,
@@ -2215,16 +2277,23 @@ static int run_vdn_softmax(h3_dit *dit, const h3_dit_block *weight,
                 dit->gpu, dit->vdn_window_output, dit->vdn_window_query,
                 dit->key, dit->value, dense_rows, rows, HEADS, HEAD_DIM,
                 1.0f / sqrtf((float)HEAD_DIM)) ||
-            !vdn_copy_rows(dit, dit->attention_heads, 0,
-                           dit->vdn_window_output, 0,
-                           dit->video_target_start) ||
-            !vdn_copy_rows(dit, dit->attention_heads,
-                           dit->video_target_start, dit->vdn_window_output,
-                           dit->video_target_start, frame_rows) ||
-            !vdn_copy_rows(dit, dit->attention_heads,
-                           dit->video_target_start + (frames - 1) * frame_rows,
-                           dit->vdn_window_output,
-                           dit->video_target_start + frame_rows, frame_rows))
+            !h3_gpu_vdn_copy_gate_heads_bf16(
+                dit->gpu, dit->attention_heads, 0,
+                dit->vdn_window_output, 0, dit->vdn_softmax_gate, 0,
+                dit->video_target_start, HEADS, HEAD_DIM, 0) ||
+            !h3_gpu_vdn_copy_gate_heads_bf16(
+                dit->gpu, dit->attention_heads, dit->video_target_start,
+                dit->vdn_window_output, dit->video_target_start,
+                dit->vdn_softmax_gate, dit->video_target_start,
+                frame_rows, HEADS, HEAD_DIM, 0) ||
+            !h3_gpu_vdn_copy_gate_heads_bf16(
+                dit->gpu, dit->attention_heads,
+                dit->video_target_start + (frames - 1) * frame_rows,
+                dit->vdn_window_output,
+                dit->video_target_start + frame_rows,
+                dit->vdn_softmax_gate,
+                dit->video_target_start + (frames - 1) * frame_rows,
+                frame_rows, HEADS, HEAD_DIM, 0))
             goto failed;
         for (uint32_t chunk = 0; chunk < chunks;) {
             h3_vdn_window_plan plans[VDN_WINDOW_BATCH_CAP];
@@ -2244,6 +2313,10 @@ static int run_vdn_softmax(h3_dit *dit, const h3_dit_block *weight,
             }
             uint64_t query_rows = (uint64_t)batch * plans[0].query_rows;
             uint64_t kv_rows = (uint64_t)batch * plans[0].kv_rows;
+            int head_major_fp16 =
+                getenv("H3_VDN_FP16_HEAD_MAJOR_SDPA") != NULL;
+            uint32_t query_stride = plans[0].query_rows;
+            uint32_t kv_stride = plans[0].kv_rows;
             if (query_rows > dit->vdn_window_query_rows ||
                 kv_rows > dit->vdn_window_kv_rows) {
                 fail(error, error_size,
@@ -2252,32 +2325,44 @@ static int run_vdn_softmax(h3_dit *dit, const h3_dit_block *weight,
             }
             for (uint32_t index = 0; index < batch; index++)
                 if (!vdn_pack_window_group(
-                        dit, &plans[index], index, plans[0].query_rows,
-                        plans[0].kv_rows)) goto failed;
-            if (!h3_gpu_cross_sdpa_batched_bf16(
+                        dit, &plans[index], index, query_stride,
+                        kv_stride, head_major_fp16)) goto failed;
+            int attention_ok = head_major_fp16 ?
+                h3_gpu_cross_sdpa_batched_fp16_head_major_storage(
                     dit->gpu, dit->vdn_window_output,
                     dit->vdn_window_query, dit->vdn_window_key,
                     dit->vdn_window_value, batch, plans[0].query_rows,
                     plans[0].kv_rows, HEADS, HEAD_DIM,
-                    1.0f / sqrtf((float)HEAD_DIM))) goto failed;
+                    1.0f / sqrtf((float)HEAD_DIM)) :
+                getenv("H3_VDN_FP16_SDPA") ?
+                h3_gpu_cross_sdpa_batched_fp16_storage(
+                    dit->gpu, dit->vdn_window_output,
+                    dit->vdn_window_query, dit->vdn_window_key,
+                    dit->vdn_window_value, batch, plans[0].query_rows,
+                    plans[0].kv_rows, HEADS, HEAD_DIM,
+                    1.0f / sqrtf((float)HEAD_DIM)) :
+                h3_gpu_cross_sdpa_batched_bf16(
+                    dit->gpu, dit->vdn_window_output,
+                    dit->vdn_window_query, dit->vdn_window_key,
+                    dit->vdn_window_value, batch, plans[0].query_rows,
+                    plans[0].kv_rows, HEADS, HEAD_DIM,
+                    1.0f / sqrtf((float)HEAD_DIM));
+            if (!attention_ok) goto failed;
             for (uint32_t index = 0; index < batch; index++)
-                if (!vdn_copy_rows(
-                        dit, dit->attention_heads,
+                if (!h3_gpu_vdn_copy_gate_heads_bf16(
+                        dit->gpu, dit->attention_heads,
                         dit->video_target_start +
                             plans[index].query_first * frame_rows,
-                        dit->vdn_window_output,
-                        index * plans[0].query_rows,
-                        plans[index].query_rows)) goto failed;
+                        dit->vdn_window_output, index * query_stride,
+                        dit->vdn_softmax_gate,
+                        dit->video_target_start +
+                            plans[index].query_first * frame_rows,
+                        plans[index].query_rows, HEADS, HEAD_DIM,
+                        !head_major_fp16 &&
+                            getenv("H3_VDN_FP16_SDPA"))) goto failed;
             chunk += batch;
         }
     }
-    if (!h3_gpu_linear_bf16(
-            dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
-            weight->vdn.softmax_gate, weight->vdn.softmax_gate_bias,
-            rows, HIDDEN, HEADS) ||
-        !h3_gpu_vdn_gate_heads_bf16(
-            dit->gpu, dit->attention_heads, dit->vdn_softmax_gate,
-            rows, HEADS, HEAD_DIM)) goto failed;
     return 1;
 failed:
     fail(error, error_size, "VDN softmax branch: %s", h3_gpu_error(dit->gpu));
@@ -2307,9 +2392,15 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
     VDN_OP(h3_gpu_vdn_text_features_bf16(
         dit->gpu, dit->vdn_window_key, dit->vdn_window_value, dit->qkv,
         0, dit->text_rows, HEADS, HEAD_DIM), "VDN text features");
-    VDN_OP(h3_gpu_linear_bf16(
-        dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
-        weight->vdn.beta, NULL, dit->text_rows, HIDDEN, HEADS),
+    VDN_OP(weight->vdn.beta_int8 && dit->text_rows >= 128 ?
+        h3_gpu_linear_int8_56_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_attention,
+            weight->vdn.beta_int8, weight->vdn.beta_scales, NULL,
+            dit->text_rows, HIDDEN, 0) :
+        h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->mod_attention,
+            weight->vdn.beta, NULL, dit->text_rows, HIDDEN, HEADS),
         "VDN text beta");
     VDN_OP(h3_gpu_vdn_statistics_f32(
         dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_window_key,
@@ -2346,13 +2437,26 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
         dit->gpu, dit->qkv, dit->value, weight->vdn.v_temporal,
         inner_frames, frame_rows, HEADS, HEAD_DIM, 0),
         "VDN value temporal convolution");
-    VDN_OP(h3_gpu_linear_bf16(
-        dit->gpu, dit->vdn_softmax_gate, dit->vdn_video_hidden,
-        weight->vdn.beta, NULL, inner_rows, HIDDEN, HEADS),
+    VDN_OP(weight->vdn.beta_int8 ?
+        h3_gpu_linear_int8_56_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->int8_activation,
+            dit->int8_activation_scales, dit->vdn_video_hidden,
+            weight->vdn.beta_int8, weight->vdn.beta_scales, NULL,
+            inner_rows, HIDDEN, 0) :
+        h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_softmax_gate, dit->vdn_video_hidden,
+            weight->vdn.beta, NULL, inner_rows, HIDDEN, HEADS),
         "VDN video beta");
-    VDN_OP(h3_gpu_vdn_statistics_f32(
-        dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_feature, dit->qkv,
-        dit->vdn_softmax_gate, inner_frames, frame_rows, HEADS, HEAD_DIM),
+    VDN_OP(getenv("H3_VDN_FP16_STATS") ?
+        h3_gpu_vdn_statistics_fp16(
+            dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_feature, dit->qkv,
+            dit->vdn_softmax_gate,
+            dit->vdn_rhs, dit->vdn_solution,
+            dit->vdn_prefix, inner_frames, frame_rows, HEADS, HEAD_DIM) :
+        h3_gpu_vdn_statistics_f32(
+            dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_feature, dit->qkv,
+            dit->vdn_softmax_gate,
+            inner_frames, frame_rows, HEADS, HEAD_DIM),
         "VDN video statistics");
     VDN_OP(h3_gpu_vdn_frame_mean_f32(
         dit->gpu, dit->vdn_frame_mean, dit->vdn_video_hidden,
@@ -2386,19 +2490,41 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
         dit->gpu, dit->value, dit->query,
         dit->vdn_state ? dit->vdn_state : dit->key,
         inner_frames, frame_rows, HEADS, HEAD_DIM), "VDN state readout");
-    VDN_OP(h3_gpu_linear_bf16(
-        dit->gpu, dit->vdn_gate_down, dit->vdn_video_hidden,
-        weight->vdn.output_gate_down, NULL,
-        inner_rows, HIDDEN, HEAD_DIM), "VDN output gate down");
-    VDN_OP(h3_gpu_linear_bf16(
-        dit->gpu, dit->qkv, dit->vdn_gate_down,
-        weight->vdn.output_gate_up, weight->vdn.output_gate_up_bias,
-        inner_rows, HEAD_DIM, INNER), "VDN output gate up");
+    VDN_OP(weight->vdn.output_gate_down_int8 ?
+        h3_gpu_linear_int8_prequantized_bf16(
+            dit->gpu, dit->vdn_gate_down, dit->int8_activation,
+            dit->int8_activation_scales,
+            weight->vdn.output_gate_down_int8,
+            weight->vdn.output_gate_down_scales,
+            inner_rows, HIDDEN, HEAD_DIM, 0) :
+        h3_gpu_linear_bf16(
+            dit->gpu, dit->vdn_gate_down, dit->vdn_video_hidden,
+            weight->vdn.output_gate_down, NULL,
+            inner_rows, HIDDEN, HEAD_DIM), "VDN output gate down");
+    VDN_OP(weight->vdn.output_gate_up_int8 ?
+        h3_gpu_linear_int8_bias_bf16(
+            dit->gpu, dit->qkv, dit->int8_activation,
+            dit->int8_activation_scales, dit->vdn_gate_down,
+            weight->vdn.output_gate_up_int8,
+            weight->vdn.output_gate_up_scales,
+            weight->vdn.output_gate_up_bias,
+            inner_rows, HEAD_DIM, INNER, 0) :
+        h3_gpu_linear_bf16(
+            dit->gpu, dit->qkv, dit->vdn_gate_down,
+            weight->vdn.output_gate_up, weight->vdn.output_gate_up_bias,
+            inner_rows, HEAD_DIM, INNER), "VDN output gate up");
     VDN_OP(h3_gpu_vdn_epilogue_bf16(
         dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
         inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
         "VDN linear epilogue");
-    if (getenv("H3_DISABLE_VDN_SPLIT_NAX"))
+    if (weight->vdn.output_int8)
+        VDN_OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, dit->vdn_projected, dit->int8_activation,
+            dit->int8_activation_scales, dit->vdn_feature,
+            weight->vdn.output_int8, weight->vdn.output_scales,
+            inner_rows, INNER, HIDDEN, 0),
+            "VDN int8 linear output projection");
+    else if (getenv("H3_DISABLE_VDN_SPLIT_NAX"))
         VDN_OP(h3_gpu_linear_bf16(
             dit->gpu, dit->vdn_projected, dit->vdn_feature,
             weight->vdn.output, NULL, inner_rows, INNER, HIDDEN),
@@ -2521,7 +2647,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
-           "DiT attention output");
+            "DiT attention output");
     }
     if (dit->vdn &&
         !run_vdn_linear(dit, weight, rows, error, error_size)) return 0;
