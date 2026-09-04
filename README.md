@@ -158,6 +158,7 @@ H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
 H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
 H3_VDN_TENSOR_READOUT=1 H3_VDN_TENSOR_READOUT_128=1 \
+H3_VDN_TENSOR_READOUT_256=1 \
 H3_VDN_FP16_SCAN=1 H3_VDN_TENSOR_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
@@ -181,6 +182,9 @@ direct Metal 4 TensorOps tile, avoiding the MPSGraph transpose/feed wrapper;
 the graph readout remains the fallback when the flag is unset.
 `H3_VDN_TENSOR_READOUT_128=1` selects a fixed 128-column readout tile for the
 H3 head width, replacing the conservative two-tile 128x64 variant.
+`H3_VDN_TENSOR_READOUT_256=1` additionally selects a 256-row readout tile
+with a 512-thread cooperative group; it is only used with the fixed 128-wide
+head tile and falls back automatically when the device cannot dispatch it.
 `H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
 reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
 solve-pack pass emits those compact transition/injection banks directly, so

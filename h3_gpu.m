@@ -561,6 +561,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4"];
             [names addObject:@"h3_vdn_readout_bf16_nax_r128"];
             [names addObject:@"h3_vdn_readout_bf16_nax_r128x128"];
+            [names addObject:@"h3_vdn_readout_bf16_nax_r256x128"];
             [names addObject:@"h3_vdn_scan_fp16_nax_fused"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
@@ -3994,40 +3995,64 @@ int h3_gpu_vdn_readout_bf16(
      * for older devices and numerical A/B comparisons. */
     if (gpu.tensorOpsEnabled && getenv("H3_VDN_TENSOR_READOUT") &&
         dim % 64 == 0 && batches <= UINT32_MAX / tokens) {
-        BOOL wide = dim == 128 && getenv("H3_VDN_TENSOR_READOUT_128");
-        NSString *pipeline_name = wide ?
-            @"h3_vdn_readout_bf16_nax_r128x128" :
-            @"h3_vdn_readout_bf16_nax_r128";
+        BOOL wide_columns = dim == 128 &&
+            getenv("H3_VDN_TENSOR_READOUT_128");
+        BOOL wide_rows = wide_columns &&
+            getenv("H3_VDN_TENSOR_READOUT_256");
+        NSString *pipeline_name = wide_rows ?
+            @"h3_vdn_readout_bf16_nax_r256x128" :
+            wide_columns ? @"h3_vdn_readout_bf16_nax_r128x128" :
+                           @"h3_vdn_readout_bf16_nax_r128";
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
             gpu, pipeline_name);
-        NSUInteger required_threads = wide ? 256u : 128u;
-        if (!pipeline ||
-            pipeline.maxTotalThreadsPerThreadgroup < required_threads) {
-            h3_gpu_set_error(gpu,
-                @"device cannot dispatch TensorOps VDN readout");
-            return 0;
+        NSUInteger required_threads = wide_rows ? 512u :
+            (wide_columns ? 256u : 128u);
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup <
+            required_threads) {
+            /* A device may expose TensorOps but cap a threadgroup below the
+             * 512 threads used by the widest tile.  Step down through the
+             * fixed-shape variants before falling back to the cached graph. */
+            if (wide_rows) {
+                wide_rows = NO;
+                pipeline_name = wide_columns ?
+                    @"h3_vdn_readout_bf16_nax_r128x128" :
+                    @"h3_vdn_readout_bf16_nax_r128";
+                required_threads = wide_columns ? 256u : 128u;
+                pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+            }
+            if ((!pipeline || pipeline.maxTotalThreadsPerThreadgroup <
+                 required_threads) && wide_columns) {
+                wide_columns = NO;
+                pipeline_name = @"h3_vdn_readout_bf16_nax_r128";
+                required_threads = 128u;
+                pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+            }
         }
-        typedef struct { uint32_t batches, tokens, dim; } args_type;
-        args_type args = {(uint32_t)batches, tokens, dim};
-        uint32_t row_tiles = (tokens + 127u) / 128u;
-        uint32_t column_tiles = wide ? 1u : (dim + 63u) / 64u;
-        @autoreleasepool {
-            id<MTLComputeCommandEncoder> encoder =
-                [gpu.command computeCommandEncoder];
-            [encoder setComputePipelineState:pipeline];
-            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
-            [encoder setBuffer:TENSOR(state).buffer offset:0 atIndex:1];
-            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
-            [encoder setBytes:&args length:sizeof(args) atIndex:3];
-            [encoder dispatchThreadgroups:
-                MTLSizeMake(row_tiles, column_tiles, batches)
-                threadsPerThreadgroup:MTLSizeMake(required_threads, 1, 1)];
-            [encoder endEncoding];
+        if (pipeline && pipeline.maxTotalThreadsPerThreadgroup >=
+            required_threads) {
+            typedef struct { uint32_t batches, tokens, dim; } args_type;
+            args_type args = {(uint32_t)batches, tokens, dim};
+            uint32_t row_tile = wide_rows ? 256u : 128u;
+            uint32_t row_tiles = (tokens + row_tile - 1u) / row_tile;
+            uint32_t column_tiles = wide_columns ? 1u : (dim + 63u) / 64u;
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> encoder =
+                    [gpu.command computeCommandEncoder];
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(state).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+                [encoder setBytes:&args length:sizeof(args) atIndex:3];
+                [encoder dispatchThreadgroups:
+                    MTLSizeMake(row_tiles, column_tiles, batches)
+                    threadsPerThreadgroup:MTLSizeMake(required_threads, 1, 1)];
+                [encoder endEncoding];
+            }
+            h3_gpu_stats stats = gpu.stats;
+            stats.direct_dispatches++;
+            gpu.stats = stats;
+            return 1;
         }
-        h3_gpu_stats stats = gpu.stats;
-        stats.direct_dispatches++;
-        gpu.stats = stats;
-        return 1;
     }
     H3VDNReadout *readout = h3_gpu_vdn_readout_graph(
         gpu, (uint32_t)batches, tokens, dim);

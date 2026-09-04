@@ -2482,6 +2482,35 @@ kernel void h3_vdn_readout_bf16_nax_r128x128(
     mm.run(mx, mw, my);
 }
 
+/* The 256-row variant uses the same complete 128-column state tile while
+ * doubling the query rows owned by each cooperative group.  This is useful
+ * for the long H3 video windows (typically 405 tokens per frame), where the
+ * 128-row form otherwise launches four groups per frame/head. */
+kernel void h3_vdn_readout_bf16_nax_r256x128(
+                                device bfloat *query [[buffer(0)]],
+                                device bfloat *state [[buffer(1)]],
+                                device bfloat *output [[buffer(2)]],
+                                constant vdn_readout_args &args [[buffer(3)]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        query, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.tokens)));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        state, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.dim)));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        output, dextents<int32_t, 2>((int)args.dim,
+                                     (int)(args.batches * args.tokens)));
+    uint query_row = group.z * args.tokens + group.x * 256;
+    auto mx = x.slice(0, (int)query_row);
+    auto mw = w.slice(0, (int)(group.z * args.dim));
+    auto my = y.slice(0, (int)query_row);
+    matmul2d<matmul2d_descriptor(256, 128, dynamic_extent,
+                                 false, true, false),
+             execution_simdgroups<16>> mm;
+    mm.run(mx, mw, my);
+}
+
 /* The MPS FP16 scan encodes one matrix product per frame because each state
  * depends on the preceding frame.  On Metal 4 a head can instead retain its
  * 128x128 state in threadgroup memory while the loop walks the whole
@@ -2494,7 +2523,7 @@ struct vdn_scan_tensor_args { uint frames; uint heads; uint dim; };
 kernel void h3_vdn_scan_fp16_nax_fused(
                                 device half *prefix [[buffer(0)]],
                                 device half *suffix [[buffer(1)]],
-                                device const half *scratch [[buffer(2)]],
+                                device half *scratch [[buffer(2)]],
                                 device const half *text [[buffer(3)]],
                                 constant vdn_scan_tensor_args &args
                                     [[buffer(4)]],
@@ -2516,13 +2545,13 @@ kernel void h3_vdn_scan_fp16_nax_fused(
     for (uint step = 0; step < args.frames; step++) {
         uint frame = reverse ? args.frames - 1u - step : step;
         uint matrix = frame * frame_stride + head * MATRIX;
-        device const half *transition = scratch + matrix;
+        device half *transition = scratch + matrix;
         device const half *injection = scratch + bank + matrix;
         device half *destination = (reverse ? suffix : prefix) + matrix;
         auto state = tensor<threadgroup half, dextents<int32_t, 2>,
                             tensor_inline>(
             current, dextents<int32_t, 2>(TILE, TILE));
-        auto transform = tensor<device const half,
+        auto transform = tensor<device half,
                                 dextents<int32_t, 2>, tensor_inline>(
             transition, dextents<int32_t, 2>(TILE, TILE));
         constexpr auto descriptor = matmul2d_descriptor(
@@ -2530,6 +2559,7 @@ kernel void h3_vdn_scan_fp16_nax_fused(
         matmul2d<descriptor, execution_simdgroups<8>> mm;
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(state), decltype(transform), half>();
+        mm.run(state, transform, accum);
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++)
             if (accum.is_valid_element(element)) {
