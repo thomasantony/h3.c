@@ -5051,6 +5051,82 @@ template [[host_name("h3_fc1_swiglu_int8_nax_r128_full_k5376")]]
 kernel h3_fc1_swiglu_int8_nax_r128_t
     h3_fc1_swiglu_int8_nax_r128_impl<5376, 5376>;
 
+/* Long H3 sequences spend most of their MLP time in FC1.  This fixed-shape
+ * 256x128 tile keeps the same two-pass SwiGLU rounding boundary as the 128-row
+ * kernel, but halves the number of row tiles.  The 16-SIMD-group scope keeps
+ * the cooperative fragment at the same per-thread capacity as the 128x128
+ * form while using the device's wider 512-thread dispatch. */
+kernel void h3_fc1_swiglu_int8_nax_r256_full_k5376(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW_TILE = 256;
+    constexpr uint COLUMN_TILE = 128;
+    constexpr uint INPUT_DIM = 5376;
+    constexpr uint OUTPUT_DIM = 14336;
+    constexpr uint FRAGMENT_CAPACITY = 64;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = OUTPUT_DIM / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)INPUT_DIM,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)INPUT_DIM,
+                                     (int)OUTPUT_DIM * 2));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, INPUT_DIM, false, true, true,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<descriptor, execution_simdgroups<16>> mm;
+    thread bfloat gate_values[FRAGMENT_CAPACITY];
+    {
+        auto a = x.slice<ROW_TILE, INPUT_DIM>(0, (int)row_start);
+        auto b = w.slice<INPUT_DIM, COLUMN_TILE>(0, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(a), decltype(b), int32_t>();
+        mm.run(a, b, accum);
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            gate_values[element] = (bfloat)(
+                (float)accum[element] * input_scales[row] *
+                weight_scales[column]);
+        }
+    }
+    {
+        auto a = x.slice<ROW_TILE, INPUT_DIM>(0, (int)row_start);
+        auto b = w.slice<INPUT_DIM, COLUMN_TILE>(
+            0, (int)OUTPUT_DIM + (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(a), decltype(b), int32_t>();
+        mm.run(a, b, accum);
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            if (row >= args.rows) continue;
+            float gate = (float)gate_values[element];
+            float up = (float)accum[element] * input_scales[row] *
+                       weight_scales[OUTPUT_DIM + column];
+            output[row * OUTPUT_DIM + column] =
+                (bfloat)(gate / (1.0f + exp(-gate)) * up);
+        }
+    }
+}
+
 /* Gate and up use the same cooperative-fragment mapping. Preserve the gate's
  * existing BF16 rounding point in thread-private storage, then consume it
  * after the up projection without a 32 KiB threadgroup tile or barrier. */

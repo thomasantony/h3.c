@@ -566,6 +566,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_full_k5376"];
+            [names addObject:@"h3_fc1_swiglu_int8_nax_r256_full_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128x64_output56"];
@@ -5922,16 +5923,20 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          int use_int8_row_fc2,
                          int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
-    uint32_t padded_rows = (rows + 127u) & ~127u;
-    uint32_t fc2_scale_groups = hidden_dim / 1024u;
-    size_t activation_capacity = (size_t)padded_rows *
-        MAX(input_dim, hidden_dim);
     const char *stage = getenv("H3_INT8_MLP_STAGE");
     BOOL int8_fc1 = !stage || (strcmp(stage, "fc2") &&
                                strcmp(stage, "bf16"));
     BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
                                strcmp(stage, "bf16"));
-    if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 127u ||
+    BOOL fc1_row256_requested = int8_fc1 && input_dim == 5376u &&
+        hidden_dim == 14336u && rows >= 256u &&
+        getenv("H3_INT8_FC1_ROW256") != NULL;
+    uint32_t padded_rows = fc1_row256_requested ?
+        (rows + 255u) & ~255u : (rows + 127u) & ~127u;
+    uint32_t fc2_scale_groups = hidden_dim / 1024u;
+    size_t activation_capacity = (size_t)padded_rows *
+        MAX(input_dim, hidden_dim);
+    if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 255u ||
         (input_dim % 128) || (hidden_dim % 128) || (output_dim % 128) ||
         !h3_gpu_require_i8(gpu, quantized_activation, activation_capacity,
                            @"int8 MLP activation") ||
@@ -5971,6 +5976,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         gpu, @"h3_fc1_swiglu_int8_nax_r128_k5376");
     id<MTLComputePipelineState> fc1_full = h3_gpu_pipeline(
         gpu, @"h3_fc1_swiglu_int8_nax_r128_full_k5376");
+    id<MTLComputePipelineState> fc1_full_r256 = fc1_row256_requested ?
+        h3_gpu_pipeline(gpu, @"h3_fc1_swiglu_int8_nax_r256_full_k5376") : nil;
     id<MTLComputePipelineState> fc1_local = h3_gpu_pipeline(
         gpu, @"h3_fc1_swiglu_int8_local_nax_r128");
     id<MTLComputePipelineState> fc2 = h3_gpu_pipeline(
@@ -6024,7 +6031,11 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             strcmp(known_override, "0") != 0;
     BOOL int8_fc1_full = int8_fc1_known &&
         getenv("H3_DISABLE_FC1_FULL_K") == NULL;
+    BOOL int8_fc1_row256 = fc1_row256_requested && int8_fc1_full &&
+        !int8_fc1_local && fc1_full_r256 &&
+        fc1_full_r256.maxTotalThreadsPerThreadgroup >= 512u;
     uint32_t row_tiles = padded_rows / 128;
+    uint32_t fc1_row_tiles = int8_fc1_row256 ? padded_rows / 256u : row_tiles;
     if (input_is_quantized && !int8_fc1) {
         h3_gpu_set_error(gpu,
             @"prequantized MLP input requires the int8 FC1 path");
@@ -6039,7 +6050,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
-        [encoder setComputePipelineState:int8_fc1_local ? fc1_local :
+        [encoder setComputePipelineState:int8_fc1_row256 ? fc1_full_r256 :
+            int8_fc1_local ? fc1_local :
             int8_fc1_full ? fc1_full :
             int8_fc1_known ? fc1_known : fc1];
         [encoder setBuffer:TENSOR(quantized_activation).buffer
@@ -6051,8 +6063,9 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(activated).buffer offset:0 atIndex:4];
         [encoder setBytes:&fc1_args length:sizeof(fc1_args) atIndex:5];
         [encoder dispatchThreadgroups:
-            MTLSizeMake((NSUInteger)row_tiles * (hidden_dim / 128), 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            MTLSizeMake((NSUInteger)fc1_row_tiles * (hidden_dim / 128), 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(
+                     int8_fc1_row256 ? 512u : 256u, 1, 1)];
         [encoder endEncoding];
     } else if (!h3_gpu_fc1_swiglu_nax_bf16(
                    opaque, activated, input, fc1_bf16,

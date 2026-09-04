@@ -1729,7 +1729,9 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) {
-        size_t padded_sequence = (sequence + 127) & ~(size_t)127;
+        size_t alignment = dit->int8_mlp &&
+            getenv("H3_INT8_FC1_ROW256") ? 255u : 127u;
+        size_t padded_sequence = (sequence + alignment) & ~alignment;
         dit->int8_activation = h3_gpu_tensor_new_i8(
             dit->gpu, padded_sequence * FFN);
         dit->int8_activation_scales = h3_gpu_tensor_new_f32(
