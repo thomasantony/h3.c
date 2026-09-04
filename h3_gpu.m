@@ -528,6 +528,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_qkv_project_split_bf16_nax_r128_morton4"];
             [names addObject:@"h3_qk_rope_bf16_nax_inplace"];
             [names addObject:@"h3_vdn_linear_f32_bf16_nax_r128"];
+            [names addObject:@"h3_vdn_linear_alpha_f32_bf16_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
@@ -2793,9 +2794,46 @@ int h3_gpu_vdn_linear_alpha_f32_bf16(
         !h3_gpu_require_bf16(gpu, dt_bias, output_dim,
                              @"VDN fused alpha bias") ||
         !h3_gpu_require_bf16(gpu, a_log, heads,
-                             @"VDN fused alpha log") ||
+                            @"VDN fused alpha log") ||
         !h3_gpu_require_f32(gpu, output, output_elements,
                             @"VDN fused alpha output")) return 0;
+    typedef struct {
+        uint32_t rows, input_dim, output_dim, heads, head_dim;
+    } args_type;
+    /* Keep the activation in the TensorOps cooperative result so the wide
+     * alpha-up projection does not write and reread a temporary F32 matrix. */
+    if (gpu.tensorOpsEnabled && getenv("H3_VDN_TENSOR_LINEAR") &&
+        input_dim % 32 == 0 && output_dim % 64 == 0) {
+        id<MTLComputePipelineState> tensor_pipeline =
+            gpu.pipelines[@"h3_vdn_linear_alpha_f32_bf16_nax_r128"];
+        if (tensor_pipeline) {
+            if (!h3_gpu_require_command(gpu)) return 0;
+            args_type tensor_args = {rows, input_dim, output_dim,
+                                     heads, head_dim};
+            uint32_t row_tiles = (rows + 127u) / 128u;
+            uint32_t column_tiles = (output_dim + 63u) / 64u;
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> encoder =
+                    [gpu.command computeCommandEncoder];
+                [encoder setComputePipelineState:tensor_pipeline];
+                [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(dt_bias).buffer offset:0 atIndex:3];
+                [encoder setBuffer:TENSOR(a_log).buffer offset:0 atIndex:4];
+                [encoder setBytes:&tensor_args length:sizeof(tensor_args)
+                           atIndex:5];
+                [encoder dispatchThreadgroups:
+                    MTLSizeMake(row_tiles, column_tiles, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [encoder endEncoding];
+            }
+            h3_gpu_stats stats = gpu.stats;
+            stats.direct_dispatches++;
+            gpu.stats = stats;
+            return 1;
+        }
+    }
     /* The tiled mixed-precision GEMM writes the projection first, then reuses
      * the exact alpha activation kernel.  This adds one pointwise pass but is
      * substantially faster for the wide alpha-up matrix; alpha-down can also
@@ -2809,9 +2847,6 @@ int h3_gpu_vdn_linear_alpha_f32_bf16(
         return h3_gpu_vdn_alpha_f32(
             opaque, output, output, dt_bias, a_log, rows, heads, head_dim);
     }
-    typedef struct {
-        uint32_t rows, input_dim, output_dim, heads, head_dim;
-    } args_type;
     args_type args = {rows, input_dim, output_dim, heads, head_dim};
     int kvec4 = input_dim % 4 == 0 &&
         !getenv("H3_DISABLE_VDN_LINEAR_KVEC4");

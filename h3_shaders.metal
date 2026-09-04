@@ -2895,6 +2895,54 @@ kernel void h3_vdn_linear_f32_bf16_nax_r128(
     mm.run(mx, mw, my);
 }
 
+/* Fused TensorOps alpha-up variant.  The cooperative result exposes the
+ * output tile to each SIMD group, allowing the FrameKDA activation to be
+ * applied before the projection ever reaches device memory. */
+kernel void h3_vdn_linear_alpha_f32_bf16_nax_r128(
+                           device float *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device float *output [[buffer(2)]],
+                           device const ushort *dt_bias [[buffer(3)]],
+                           device const ushort *a_log [[buffer(4)]],
+                           constant vdn_alpha_linear_args &args
+                               [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device float, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim, (int)args.output_dim));
+    auto mx = x.slice(0, (int)group.x * 128);
+    auto mw = w.slice((int)group.y * 64, 0);
+    constexpr auto descriptor = matmul2d_descriptor(
+        128, 64, dynamic_extent, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    auto first_a = x.slice(0, (int)group.x * 128);
+    auto first_b = w.slice((int)group.y * 64, 0);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), float>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0.0f;
+    mm.run(mx, mw, accum);
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = group.x * 128 + (uint)index[1];
+        uint column = group.y * 64 + (uint)index[0];
+        if (row < args.rows && column < args.output_dim) {
+            float projected = accum[element] +
+                h3_bf16_to_f32(dt_bias[column]);
+            uint head = column / args.head_dim;
+            output[row * args.output_dim + column] =
+                h3_vdn_alpha_activate(
+                    projected, h3_bf16_to_f32(a_log[head]));
+        }
+    }
+}
+
 /* Draw Things' Metal 4 matmul schedules neighboring row/column tiles in
  * Morton order. The decoder is adapted from ccv's BSD-3-Clause NAMatMul;
  * see THIRD_PARTY_NOTICES.md. Keep it local so the ordinary Metal path stays
