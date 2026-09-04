@@ -194,6 +194,10 @@ general pack kernel remains the fallback for other dimensions.
 `H3_INT8_LINEAR_KNOWN_LONG=1` extends the compile-time 7,168→5,376 int8
 projection kernel to long VDN row counts; it is opt-in because the generic
 dynamic-shape kernel can win on some devices.
+`H3_VDN_FUSED_OUTPUT_ADD=1` lets that fixed-shape int8 output projection add
+directly into the residual attention rows, removing the BF16 VDN staging
+write/read.  It is used only with `H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1` and
+local int8 scales enabled.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 

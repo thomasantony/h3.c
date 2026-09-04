@@ -2838,6 +2838,9 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
     int fused_output_quantize = weight->vdn.output_int8 &&
         int8_activation_ready &&
         getenv("H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8") != NULL;
+    int fused_output_add = fused_output_quantize &&
+        getenv("H3_VDN_FUSED_OUTPUT_ADD") != NULL &&
+        getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
     if (fused_output_quantize)
         VDN_OP(h3_gpu_vdn_epilogue_quantize_int8(
             dit->gpu, dit->int8_activation, dit->int8_activation_scales,
@@ -2849,7 +2852,13 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
             inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
             "VDN linear epilogue");
-    if (weight->vdn.output_int8)
+    if (fused_output_add)
+        VDN_OP(h3_gpu_linear_int8_prequantized_bf16_add_offset(
+            dit->gpu, dit->attention_output, dit->int8_activation,
+            dit->int8_activation_scales, weight->vdn.output_int8,
+            weight->vdn.output_scales, inner_start, inner_rows,
+            INNER, HIDDEN), "VDN fused output projection/add");
+    else if (weight->vdn.output_int8)
         VDN_OP(fused_output_quantize ?
             h3_gpu_linear_int8_prequantized_bf16(
                 dit->gpu, dit->vdn_projected, dit->int8_activation,
@@ -2871,10 +2880,11 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             dit->gpu, dit->vdn_projected, dit->vdn_feature,
             weight->vdn.output, NULL, inner_rows, INNER, HIDDEN, 2048),
             "VDN split-row linear output projection");
-    VDN_OP(h3_gpu_vdn_add_projected_bf16(
-        dit->gpu, dit->attention_output, inner_start,
-        dit->vdn_projected, inner_rows, HIDDEN),
-        "VDN branch fusion");
+    if (!fused_output_add)
+        VDN_OP(h3_gpu_vdn_add_projected_bf16(
+            dit->gpu, dit->attention_output, inner_start,
+            dit->vdn_projected, inner_rows, HIDDEN),
+            "VDN branch fusion");
     (void)rows;
     (void)state_elements;
 #undef VDN_OP

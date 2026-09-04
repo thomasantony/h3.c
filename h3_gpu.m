@@ -572,6 +572,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_linear_int8_nax_r128x256_full_k14336"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r128_add"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
@@ -5549,7 +5550,8 @@ int h3_gpu_linear_int8_56_bf16_offset(
                      offset:(input_is_quantized ?
                              (NSUInteger)input_row * sizeof(float) : 0) atIndex:2];
         [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
-        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(output).buffer
+                     offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
         [encoder dispatchThreadgroups:MTLSizeMake(padded_rows / 128u, 1, 1)
@@ -5590,12 +5592,18 @@ static int h3_gpu_linear_int8_bf16_layout(
                             uint32_t input_row,
                             BOOL inputIsQuantized,
                             BOOL headMajorInput, uint32_t heads,
-                            uint32_t headDim) {
+                            uint32_t headDim,
+                            uint32_t output_row, BOOL add_residual) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
     size_t input_offset = (size_t)input_row * input_dim;
     size_t input_count = (size_t)rows * input_dim;
     size_t quantized_count = (size_t)padded_rows * input_dim;
+    if (output_row > UINT32_MAX - rows) {
+        h3_gpu_set_error(gpu, @"int8 linear output slice is out of range");
+        return 0;
+    }
+    size_t output_offset = (size_t)output_row * output_dim;
     if (input_row && !inputIsQuantized) {
         h3_gpu_set_error(gpu,
             @"unquantized int8 linear slices are not supported");
@@ -5609,7 +5617,8 @@ static int h3_gpu_linear_int8_bf16_layout(
                             @"int8 linear weight scales") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
                                       @"int8 linear bias")) ||
-        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+        !h3_gpu_require_bf16(gpu, output, output_offset +
+                             (size_t)rows * output_dim,
                              @"int8 linear output") ||
         (inputIsQuantized &&
          (!h3_gpu_require_i8(gpu, quantized_input,
@@ -5635,10 +5644,12 @@ static int h3_gpu_linear_int8_bf16_layout(
         getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
     BOOL known_linear = local_scales && input_dim == 7168 &&
         output_dim == 5376 &&
-        (rows <= 2048 || getenv("H3_INT8_LINEAR_KNOWN_LONG")) &&
+        (add_residual || rows <= 2048 ||
+         getenv("H3_INT8_LINEAR_KNOWN_LONG")) &&
         getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+        gpu, add_residual ? @"h3_linear_int8_local_scales_nax_r128_add" :
+             known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
              local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
                             @"h3_linear_int8_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
@@ -5659,7 +5670,8 @@ static int h3_gpu_linear_int8_bf16_layout(
                      offset:(inputIsQuantized ?
                              (NSUInteger)input_row * sizeof(float) : 0) atIndex:2];
         [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
-        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(output).buffer
+                     offset:output_offset * sizeof(uint16_t) atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
         NSUInteger groups = (NSUInteger)(padded_rows / 128u) *
@@ -5686,7 +5698,7 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, NULL, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0, 0, NO);
 }
 
 int h3_gpu_linear_int8_prequantized_bf16(
@@ -5701,7 +5713,7 @@ int h3_gpu_linear_int8_prequantized_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, NULL, weight,
         weight_scales, NULL, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, 0, YES, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, YES, NO, 0, 0, 0, NO);
 }
 
 int h3_gpu_linear_int8_prequantized_bf16_offset(
@@ -5716,7 +5728,21 @@ int h3_gpu_linear_int8_prequantized_bf16_offset(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, NULL, weight,
         weight_scales, NULL, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, input_row, YES, NO, 0, 0);
+        use_slower_uncached_int8_scales, input_row, YES, NO, 0, 0, 0, NO);
+}
+
+int h3_gpu_linear_int8_prequantized_bf16_add_offset(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t output_row, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_linear_int8_bf16_layout(
+        opaque, output, quantized_input, input_scales, NULL, weight,
+        weight_scales, NULL, rows, input_dim, output_dim, 0, 0, YES, NO, 0, 0,
+        output_row, YES);
 }
 
 int h3_gpu_linear_int8_bias_bf16(
@@ -5733,7 +5759,7 @@ int h3_gpu_linear_int8_bias_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, bias, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0, 0, NO);
 }
 
 int h3_gpu_linear_int8_head_major_bf16(
@@ -5748,7 +5774,7 @@ int h3_gpu_linear_int8_head_major_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, NULL, rows, heads * head_dim, output_dim, 0, NO, YES,
-        0, heads, head_dim);
+        0, heads, head_dim, 0, NO);
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

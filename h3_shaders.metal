@@ -5180,7 +5180,7 @@ kernel void h3_linear_int8_nax_r128x256_full_k14336(
 
 /* Cache the two 128-value dequantization vectors once per projection tile.
  * The cooperative output fragment otherwise rereads them for every element. */
-template<uint INPUT_DIM, uint OUTPUT_DIM>
+template<uint INPUT_DIM, uint OUTPUT_DIM, bool ADD_RESIDUAL>
 kernel void h3_linear_int8_local_scales_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
@@ -5250,19 +5250,26 @@ kernel void h3_linear_int8_local_scales_nax_r128_impl(
                           local_input_scales[(uint)index[1]] *
                           local_weight_scales[(uint)index[0]];
             if (args.has_bias) value += h3_bf16_to_f32(bias[column]);
+            if (ADD_RESIDUAL)
+                value += (float)output[row * output_dim + column];
             output[row * output_dim + column] = (bfloat)value;
         }
     }
 }
 
-typedef decltype(h3_linear_int8_local_scales_nax_r128_impl<0, 0>)
+typedef decltype(h3_linear_int8_local_scales_nax_r128_impl<0, 0, false>)
     h3_linear_int8_local_scales_nax_r128_t;
 template [[host_name("h3_linear_int8_local_scales_nax_r128")]]
 kernel h3_linear_int8_local_scales_nax_r128_t
-    h3_linear_int8_local_scales_nax_r128_impl<0, 0>;
+    h3_linear_int8_local_scales_nax_r128_impl<0, 0, false>;
 template [[host_name("h3_linear_int8_local_scales_nax_r128_k7168")]]
 kernel h3_linear_int8_local_scales_nax_r128_t
-    h3_linear_int8_local_scales_nax_r128_impl<7168, 5376>;
+    h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, false>;
+typedef decltype(h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, true>)
+    h3_linear_int8_local_scales_nax_r128_add_t;
+template [[host_name("h3_linear_int8_local_scales_nax_r128_add")]]
+kernel h3_linear_int8_local_scales_nax_r128_add_t
+    h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, true>;
 
 /* FC2 is more sensitive to a single scale spanning all 14336 activated
  * channels.  Retain one activation scale per 1024-wide K group, accumulate

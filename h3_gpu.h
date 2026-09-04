@@ -457,6 +457,17 @@ int h3_gpu_linear_int8_prequantized_bf16_offset(
                             uint32_t input_row, uint32_t rows,
                             uint32_t input_dim, uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
+/* Fixed-shape VDN output projection that adds its result in-place to an
+ * existing BF16 residual row range, avoiding a separate staging tensor and
+ * residual-add pass. */
+int h3_gpu_linear_int8_prequantized_bf16_add_offset(
+                            h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t output_row, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_linear_int8_bias_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
