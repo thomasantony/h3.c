@@ -157,7 +157,7 @@ H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
 H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
-H3_VDN_TENSOR_READOUT=1 H3_VDN_FP16_SCAN=1 \
+H3_VDN_TENSOR_READOUT=1 H3_VDN_FP16_SCAN=1 H3_VDN_TENSOR_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
 H3_VDN_STATS_GATE_REUSE=1 H3_INT8_LINEAR_KNOWN_LONG=1 \
@@ -188,6 +188,11 @@ numerical closeness.  Because the active prepacked scan never consumes the
 FP32 solve banks afterward, that path also skips their dead stores.
 `H3_DISABLE_VDN_FP16_COMPACT_ONLY=1` restores those FP32 stores for an A/B
 comparison.
+`H3_VDN_TENSOR_SCAN=1` replaces the per-frame FP16 MPS matrix encodes with a
+Metal 4 TensorOps kernel that keeps each recurrent head state in threadgroup
+memory while walking both directions.  It is opt-in because it intentionally
+changes the scan's matrix-product implementation; the MPS FP16 scan remains
+the fallback when the device lacks the required pipeline.
 `H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1` additionally fuses the VDN epilogue with
 the row-wise int8 conversion used by the output projection, avoiding a full
 7,168-wide BF16 staging write/read.  It is restricted to the fixed H3 VDN

@@ -2453,6 +2453,67 @@ kernel void h3_vdn_readout_bf16_nax_r128(
              execution_simdgroups<4>> mm;
     mm.run(mx, mw, my);
 }
+
+/* The MPS FP16 scan encodes one matrix product per frame because each state
+ * depends on the preceding frame.  On Metal 4 a head can instead retain its
+ * 128x128 state in threadgroup memory while the loop walks the whole
+ * direction.  The two directions share one dispatch (group.y selects the
+ * forward or reverse bank), eliminating hundreds of MPSMatrix wrapper and
+ * encoder submissions per DiT block.  PREFIX's trailing half bank contains
+ * the packed text state, as established by h3_vdn_pack_state_fp16(_vec4).
+ */
+struct vdn_scan_tensor_args { uint frames; uint heads; uint dim; };
+kernel void h3_vdn_scan_fp16_nax_fused(
+                                device half *prefix [[buffer(0)]],
+                                device half *suffix [[buffer(1)]],
+                                device const half *scratch [[buffer(2)]],
+                                device const half *text [[buffer(3)]],
+                                constant vdn_scan_tensor_args &args
+                                    [[buffer(4)]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE = 128;
+    constexpr uint MATRIX = TILE * TILE;
+    uint head = group.x;
+    if (head >= args.heads || args.dim != TILE) return;
+    threadgroup half current[MATRIX];
+    uint text_base = head * MATRIX;
+    for (uint index = tid; index < MATRIX; index += 256)
+        current[index] = text[text_base + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint bank = args.frames * args.heads * MATRIX;
+    uint frame_stride = args.heads * MATRIX;
+    uint reverse = group.y;
+    for (uint step = 0; step < args.frames; step++) {
+        uint frame = reverse ? args.frames - 1u - step : step;
+        uint matrix = frame * frame_stride + head * MATRIX;
+        device const half *transition = scratch + matrix;
+        device const half *injection = scratch + bank + matrix;
+        device half *destination = (reverse ? suffix : prefix) + matrix;
+        auto state = tensor<threadgroup half, dextents<int32_t, 2>,
+                            tensor_inline>(
+            current, dextents<int32_t, 2>(TILE, TILE));
+        auto transform = tensor<device const half,
+                                dextents<int32_t, 2>, tensor_inline>(
+            transition, dextents<int32_t, 2>(TILE, TILE));
+        constexpr auto descriptor = matmul2d_descriptor(
+            TILE, TILE, dynamic_extent, false, false, false);
+        matmul2d<descriptor, execution_simdgroups<8>> mm;
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(state), decltype(transform), half>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) {
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * TILE + (uint)index[0];
+                half value = accum[element] + injection[offset];
+                current[offset] = value;
+                destination[offset] = value;
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 #endif
 
 kernel void h3_vdn_epilogue_bf16(

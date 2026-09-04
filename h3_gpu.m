@@ -560,6 +560,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4"];
             [names addObject:@"h3_vdn_readout_bf16_nax_r128"];
+            [names addObject:@"h3_vdn_scan_fp16_nax_fused"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_full_k5376"];
@@ -3639,6 +3640,39 @@ static int h3_gpu_vdn_scan_fp16_impl(
         h3_gpu_stats stats = gpu.stats;
         stats.blit_copies += 2;
         gpu.stats = stats;
+    }
+
+    /* Metal 4 can keep one head's recurrent state in threadgroup memory and
+     * walk the complete forward/reverse sequence inside a single dispatch.
+     * This avoids the per-frame MPSMatrix object churn in the reference scan;
+     * retain the MPS implementation as the default and as the fallback when
+     * the opt-in pipeline is unavailable. */
+    if (gpu.tensorOpsEnabled && getenv("H3_VDN_TENSOR_SCAN") && dim == 128) {
+        id<MTLComputePipelineState> tensor_pipeline = h3_gpu_pipeline(
+            gpu, @"h3_vdn_scan_fp16_nax_fused");
+        if (tensor_pipeline &&
+            tensor_pipeline.maxTotalThreadsPerThreadgroup >= 256) {
+            typedef struct { uint32_t frames, heads, dim; } args_type;
+            args_type args = {frames, heads, dim};
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> encoder =
+                    [gpu.command computeCommandEncoder];
+                [encoder setComputePipelineState:tensor_pipeline];
+                [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(scratch).buffer offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(prefix).buffer
+                             offset:text_offset atIndex:3];
+                [encoder setBytes:&args length:sizeof(args) atIndex:4];
+                [encoder dispatchThreadgroups:MTLSizeMake(heads, 2, 1)
+                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [encoder endEncoding];
+            }
+            h3_gpu_stats stats = gpu.stats;
+            stats.direct_dispatches++;
+            gpu.stats = stats;
+            return 1;
+        }
     }
 
     @autoreleasepool {
