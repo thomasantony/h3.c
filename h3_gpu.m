@@ -3059,13 +3059,16 @@ int h3_gpu_vdn_statistics_fp16(
         TENSOR(packed_scaled).bytes < features * sizeof(uint16_t) ||
         TENSOR(product).bytes < matrices * sizeof(uint16_t)) return 0;
     typedef struct {
-        uint32_t frames, tokens, heads, dim, value_pass;
+        uint32_t frames, tokens, heads, dim, value_pass, reuse_gate;
     } pack_args_type;
-    pack_args_type pack_args = {frames, tokens, heads, dim, 0};
     id<MTLComputePipelineState> cached_pack = gpu.pipelines[
         @"h3_vdn_pack_stats_fp16_gate_cached"];
     BOOL gate_cached = dim == 128 && getenv("H3_VDN_STATS_GATE_CACHE") &&
         cached_pack && cached_pack.maxTotalThreadsPerThreadgroup >= 256;
+    BOOL reuse_gate = gate_cached && getenv("H3_VDN_STATS_GATE_REUSE");
+    pack_args_type pack_args = {
+        frames, tokens, heads, dim, 0, reuse_gate ? 1u : 0u
+    };
     NSString *pack_name = gate_cached ?
         @"h3_vdn_pack_stats_fp16_gate_cached" : @"h3_vdn_pack_stats_fp16";
     if (!h3_gpu_dispatch_1d(gpu, pack_name,

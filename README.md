@@ -191,6 +191,10 @@ shape and remains opt-in until its device-specific timing is measured.
 `H3_VDN_STATS_GATE_CACHE=1` caches each FP16 statistics sigmoid once per
 head/token SIMD group instead of recomputing it for every 4-value vector; the
 general pack kernel remains the fallback for other dimensions.
+`H3_VDN_STATS_GATE_REUSE=1` additionally retains that cached gate in the
+FP16 beta buffer for the value pass, removing the second sigmoid evaluation;
+it is meaningful only when `H3_VDN_STATS_GATE_CACHE=1` is active and trades a
+small extra FP16 rounding step for throughput.
 `H3_INT8_LINEAR_KNOWN_LONG=1` extends the compile-time 7,168→5,376 int8
 projection kernel to long VDN row counts; it is opt-in because the generic
 dynamic-shape kernel can win on some devices.

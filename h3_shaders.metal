@@ -1473,6 +1473,7 @@ kernel void h3_vdn_temporal_feature_pair_query_vec4_bf16(
 
 struct vdn_stats_pack_args {
     uint frames; uint tokens; uint heads; uint dim; uint value_pass;
+    uint reuse_gate;
 };
 
 kernel void h3_vdn_pack_stats_fp16(
@@ -1517,7 +1518,7 @@ kernel void h3_vdn_pack_stats_fp16(
 kernel void h3_vdn_pack_stats_fp16_gate_cached(
                                 device const ushort4 *key [[buffer(0)]],
                                 device const ushort4 *value [[buffer(1)]],
-                                device const ushort *beta [[buffer(2)]],
+                                device ushort *beta [[buffer(2)]],
                                 device half4 *packed_key [[buffer(3)]],
                                 device half4 *packed_scaled [[buffer(4)]],
                                 constant vdn_stats_pack_args &args [[buffer(5)]],
@@ -1537,9 +1538,17 @@ kernel void h3_vdn_pack_stats_fp16_gate_cached(
         uint token_frame = outer / args.heads;
         uint token = token_frame % args.tokens;
         uint frame = token_frame / args.tokens;
-        float logit = h3_bf16_to_f32(
-            beta[(frame * args.tokens + token) * args.heads + head]);
-        gates[simdgroup] = 1.0f / (1.0f + exp(-logit));
+        uint beta_index = (frame * args.tokens + token) * args.heads + head;
+        float gate;
+        if (args.value_pass && args.reuse_gate) {
+            gate = h3_bf16_to_f32(beta[beta_index]);
+        } else {
+            float logit = h3_bf16_to_f32(beta[beta_index]);
+            gate = 1.0f / (1.0f + exp(-logit));
+            if (!args.value_pass && args.reuse_gate)
+                beta[beta_index] = h3_f32_to_bf16(gate);
+        }
+        gates[simdgroup] = gate;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!active) return;
