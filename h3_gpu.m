@@ -5931,17 +5931,19 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     BOOL fc1_row256_requested = int8_fc1 && input_dim == 5376u &&
         hidden_dim == 14336u && rows >= 256u &&
         getenv("H3_INT8_FC1_ROW256") != NULL;
-    uint32_t padded_rows = fc1_row256_requested ?
-        (rows + 255u) & ~255u : (rows + 127u) & ~127u;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    uint32_t fc1_padded_rows = fc1_row256_requested ?
+        (rows + 255u) & ~255u : padded_rows;
     uint32_t fc2_scale_groups = hidden_dim / 1024u;
-    size_t activation_capacity = (size_t)padded_rows *
+    size_t activation_capacity = (size_t)MAX(padded_rows, fc1_padded_rows) *
         MAX(input_dim, hidden_dim);
     if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 255u ||
         (input_dim % 128) || (hidden_dim % 128) || (output_dim % 128) ||
         !h3_gpu_require_i8(gpu, quantized_activation, activation_capacity,
                            @"int8 MLP activation") ||
         !h3_gpu_require_f32(gpu, activation_scales,
-                            (size_t)padded_rows * MAX(fc2_scale_groups, 1u),
+                            (size_t)MAX(padded_rows, fc1_padded_rows) *
+                                MAX(fc2_scale_groups, 1u),
                             @"int8 MLP activation scales") ||
         !h3_gpu_require_i8(gpu, fc1_weight,
                            (size_t)hidden_dim * 2 * input_dim,
@@ -6035,7 +6037,10 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !int8_fc1_local && fc1_full_r256 &&
         fc1_full_r256.maxTotalThreadsPerThreadgroup >= 512u;
     uint32_t row_tiles = padded_rows / 128;
-    uint32_t fc1_row_tiles = int8_fc1_row256 ? padded_rows / 256u : row_tiles;
+    uint32_t fc1_dispatch_rows = int8_fc1_row256 ? fc1_padded_rows :
+        padded_rows;
+    uint32_t fc1_row_tiles = int8_fc1_row256 ?
+        fc1_dispatch_rows / 256u : row_tiles;
     if (input_is_quantized && !int8_fc1) {
         h3_gpu_set_error(gpu,
             @"prequantized MLP input requires the int8 FC1 path");
@@ -6044,7 +6049,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (int8_fc1 && !input_is_quantized &&
         !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, input, rows,
-            padded_rows, input_dim, activation_clip,
+            fc1_dispatch_rows, input_dim, activation_clip,
             @"int8 MLP input")) return 0;
     if (int8_fc1) @autoreleasepool {
         linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
