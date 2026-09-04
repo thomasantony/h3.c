@@ -33,6 +33,7 @@
 
 @interface H3SDPA : NSObject
 @property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphExecutable *executable;
 @property(nonatomic, strong) MPSGraphTensor *query;
 @property(nonatomic, strong) MPSGraphTensor *key;
 @property(nonatomic, strong) MPSGraphTensor *value;
@@ -268,6 +269,8 @@ static int h3_gpu_require_elements(H3GPU *gpu, const h3_gpu_tensor *tensor,
 
 static int h3_gpu_require_bf16(H3GPU *gpu, const h3_gpu_tensor *tensor,
                                size_t elements, NSString *label);
+static int h3_gpu_require_i8(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                             size_t elements, NSString *label);
 static int h3_gpu_require_f32(H3GPU *gpu, const h3_gpu_tensor *tensor,
                               size_t elements, NSString *label);
 
@@ -440,25 +443,48 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         }
         NSMutableArray<NSString *> *names = [@[
             @"h3_copy_bf16_fp16_vec4", @"h3_copy_fp16_bf16_vec4",
+            @"h3_pack_vdn_window_fp16",
             @"h3_pack_bf16_fp16_head_major",
             @"h3_pack_bf16_fp16_head_major_pair",
+            @"h3_pack_bf16_head_major_source",
             @"h3_linear_f32", @"h3_linear_f32_tiled",
             @"h3_lora_merge_bf16", @"h3_lora_merge_grouped_qkv_bf16",
             @"h3_lora_merge_swap_halves_bf16",
             @"h3_vdn_gate_heads_bf16",
             @"h3_vdn_copy_gate_heads_bf16",
             @"h3_vdn_copy_gate_heads_fp16_bf16",
-            @"h3_vdn_text_features_bf16", @"h3_vdn_query_feature_bf16",
+            @"h3_vdn_copy_gate_heads_bf16_head_major_bf16",
+            @"h3_vdn_copy_gate_heads_fp16_head_major_bf16",
+            @"h3_vdn_gate_quantize_fp16_head_major_int8",
+            @"h3_vdn_gate_quantize_bf16_head_major_int8",
+            @"h3_vdn_text_features_bf16", @"h3_vdn_text_features_vec4_bf16",
+            @"h3_vdn_query_feature_bf16",
             @"h3_vdn_query_feature_vec4_bf16",
             @"h3_vdn_spatial_feature_bf16",
+            @"h3_vdn_spatial_feature_vec4_bf16",
+            @"h3_vdn_spatial_feature_pair_bf16",
+            @"h3_vdn_spatial_feature_pair_vec4_bf16",
             @"h3_vdn_temporal_feature_bf16",
             @"h3_vdn_temporal_feature_vec4_bf16",
+            @"h3_vdn_temporal_feature_pair_bf16",
+            @"h3_vdn_temporal_feature_pair_vec4_bf16",
             @"h3_vdn_pack_stats_fp16", @"h3_vdn_cast_stats_fp16_f32",
             @"h3_vdn_frame_mean_f32",
-            @"h3_vdn_linear_f32_bf16", @"h3_vdn_alpha_f32",
+            @"h3_vdn_frame_mean_vec4_f32",
+            @"h3_vdn_frame_mean_int8_vec4_f32",
+            @"h3_vdn_linear_f32_bf16",
+            @"h3_vdn_linear_f32_bf16_kvec4",
+            @"h3_vdn_linear_alpha_f32_bf16",
+            @"h3_vdn_linear_alpha_f32_bf16_kvec4",
+            @"h3_vdn_alpha_f32", @"h3_vdn_alpha_vec4_f32",
+            @"h3_vdn_prepare_solve_f32",
             @"h3_vdn_cholesky_solve_f32",
             @"h3_vdn_pack_solve_f32",
-            @"h3_vdn_scale_f32", @"h3_vdn_gather_state_bf16",
+            @"h3_vdn_scale_f32", @"h3_vdn_decay_f32",
+            @"h3_vdn_decay_vec4_f32",
+            @"h3_vdn_gather_state_bf16",
+            @"h3_vdn_gather_state_bf16_decay",
+            @"h3_vdn_gather_state_bf16_decay_vec4",
             @"h3_vdn_epilogue_bf16", @"h3_vdn_epilogue_vec4_bf16",
             @"h3_vdn_add_projected_bf16",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
@@ -1423,6 +1449,122 @@ int h3_gpu_copy_fp16_bf16(h3_gpu *opaque, h3_gpu_tensor *destination,
         });
 }
 
+int h3_gpu_pack_vdn_window_fp16(
+                          h3_gpu *opaque,
+                          h3_gpu_tensor *query_destination,
+                          h3_gpu_tensor *key_destination,
+                          h3_gpu_tensor *value_destination,
+                          const h3_gpu_tensor *query_source,
+                          const h3_gpu_tensor *key_source,
+                          const h3_gpu_tensor *value_source,
+                          uint32_t query_source_row,
+                          uint32_t query_destination_row,
+                          uint32_t query_rows,
+                          const uint32_t *kv_source_rows,
+                          const uint32_t *kv_destination_rows,
+                          const uint32_t *kv_segment_rows,
+                          uint32_t kv_segments,
+                          uint32_t destination_batch,
+                          uint32_t query_sequence, uint32_t kv_sequence,
+                          uint32_t heads,
+                          uint32_t head_dim,
+                          int source_head_major, uint32_t source_sequence) {
+    H3GPU *gpu = GPU(opaque);
+    if (!query_destination || !key_destination || !value_destination ||
+        !query_source || !key_source || !value_source || !query_rows ||
+        !kv_source_rows || !kv_destination_rows || !kv_segment_rows ||
+        !kv_segments || kv_segments > 4 || !query_sequence || !kv_sequence ||
+        !heads || !source_sequence || source_head_major < 0 ||
+        source_head_major > 1 ||
+        !head_dim || head_dim % 4 ||
+        query_source_row > UINT32_MAX - query_rows ||
+        query_source_row + query_rows > source_sequence ||
+        query_destination_row > query_sequence ||
+        query_rows > query_sequence - query_destination_row) return 0;
+    size_t row_width = (size_t)heads * head_dim;
+    size_t query_source_stop = source_head_major ?
+        ((size_t)(heads - 1) * source_sequence + query_source_row +
+         query_rows) * head_dim :
+        ((size_t)query_source_row + query_rows) * row_width;
+    size_t query_vectors = (size_t)query_rows * heads * (head_dim / 4);
+    size_t kv_vectors = 0;
+    size_t kv_destination_stop = 0;
+    for (uint32_t segment = 0; segment < kv_segments; segment++) {
+        uint32_t source_row = kv_source_rows[segment];
+        uint32_t destination_row = kv_destination_rows[segment];
+        uint32_t rows = kv_segment_rows[segment];
+        if (!rows || source_row > UINT32_MAX - rows ||
+            source_row + rows > source_sequence ||
+            destination_row > kv_sequence ||
+            rows > kv_sequence - destination_row)
+            return 0;
+        size_t source_stop = source_head_major ?
+            ((size_t)(heads - 1) * source_sequence + source_row + rows) *
+                head_dim :
+            ((size_t)source_row + rows) * row_width;
+        if (source_stop > TENSOR(key_source).elements ||
+            source_stop > TENSOR(value_source).elements) return 0;
+        kv_vectors += (size_t)rows * heads * (head_dim / 4);
+        size_t stop = ((size_t)destination_batch * heads * kv_sequence +
+                       (size_t)(heads - 1) * kv_sequence + destination_row +
+                       rows) * head_dim;
+        if (stop > kv_destination_stop) kv_destination_stop = stop;
+    }
+    if (query_vectors + kv_vectors > UINT32_MAX ||
+        query_source_stop > TENSOR(query_source).elements ||
+        ((size_t)destination_batch * heads * query_sequence +
+         (size_t)(heads - 1) * query_sequence + query_destination_row +
+         query_rows) * head_dim > TENSOR(query_destination).elements ||
+        kv_destination_stop > TENSOR(key_destination).elements ||
+        kv_destination_stop > TENSOR(value_destination).elements ||
+        !h3_gpu_require_bf16(gpu, query_source, query_source_stop,
+                             @"VDN window query source") ||
+        !h3_gpu_require_bf16(gpu, key_source, TENSOR(key_source).elements,
+                             @"VDN window key source") ||
+        !h3_gpu_require_bf16(gpu, value_source, TENSOR(value_source).elements,
+                             @"VDN window value source") ||
+        !h3_gpu_require_bf16(gpu, query_destination,
+                             TENSOR(query_destination).elements,
+                             @"VDN window query destination") ||
+        !h3_gpu_require_bf16(gpu, key_destination,
+                             TENSOR(key_destination).elements,
+                             @"VDN window key destination") ||
+        !h3_gpu_require_bf16(gpu, value_destination,
+                             TENSOR(value_destination).elements,
+                             @"VDN window value destination") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    typedef struct {
+        uint32_t query_source_row, query_destination_row;
+        uint32_t query_rows, kv_segments;
+        uint32_t kv_source_row[16];
+        uint32_t kv_destination_row[16];
+        uint32_t kv_rows[16];
+        uint32_t destination_batch, query_sequence, kv_sequence;
+        uint32_t heads, dim, source_head_major, source_sequence;
+    } args_type;
+    args_type args = {query_source_row, query_destination_row, query_rows,
+                      kv_segments, {0}, {0}, {0}, destination_batch,
+                      query_sequence, kv_sequence, heads, head_dim,
+                      (uint32_t)source_head_major, source_sequence};
+    for (uint32_t segment = 0; segment < kv_segments; segment++) {
+        args.kv_source_row[segment * 4] = kv_source_rows[segment];
+        args.kv_destination_row[segment * 4] = kv_destination_rows[segment];
+        args.kv_rows[segment * 4] = kv_segment_rows[segment];
+    }
+    return h3_gpu_dispatch_1d(
+        gpu, @"h3_pack_vdn_window_fp16",
+        (uint32_t)(query_vectors + kv_vectors),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(query_source).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key_source).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(value_source).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(query_destination).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(key_destination).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(value_destination).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
 int h3_gpu_pack_bf16_fp16_head_major(
                           h3_gpu *opaque, h3_gpu_tensor *destination,
                           const h3_gpu_tensor *source, uint32_t source_row,
@@ -1503,6 +1645,48 @@ int h3_gpu_pack_bf16_fp16_head_major_pair(
             [encoder setBuffer:TENSOR(second_destination).buffer
                          offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_pack_bf16_head_major_source(
+                          h3_gpu *opaque, h3_gpu_tensor *destination,
+                          const h3_gpu_tensor *source, uint32_t source_row,
+                          uint32_t destination_batch,
+                          uint32_t destination_row, uint32_t sequence,
+                          uint32_t rows, uint32_t heads, uint32_t head_dim,
+                          int source_head_major, uint32_t source_sequence) {
+    H3GPU *gpu = GPU(opaque);
+    if (!destination || !source || !rows || !heads || !head_dim ||
+        head_dim % 4 || source_head_major < 0 || source_head_major > 1 ||
+        !source_sequence || source_row > UINT32_MAX - rows ||
+        source_row + rows > source_sequence || destination_row > sequence ||
+        rows > sequence - destination_row) return 0;
+    size_t source_stop = (size_t)source_sequence * heads * head_dim;
+    size_t destination_stop =
+        ((size_t)destination_batch * heads * sequence +
+         (size_t)(heads - 1) * sequence + destination_row + rows) * head_dim;
+    size_t vector_count = (size_t)rows * heads * (head_dim / 4);
+    if (source_stop > TENSOR(source).elements ||
+        destination_stop > TENSOR(destination).elements ||
+        vector_count > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, source, source_stop,
+                             @"head-major BF16 source") ||
+        !h3_gpu_require_bf16(gpu, destination, destination_stop,
+                             @"head-major BF16 destination")) return 0;
+    typedef struct {
+        uint32_t source_row, destination_batch, destination_row;
+        uint32_t sequence, rows, heads, dim;
+        uint32_t source_head_major, source_sequence;
+    } args_type;
+    args_type args = {source_row, destination_batch, destination_row,
+                      sequence, rows, heads, head_dim,
+                      (uint32_t)source_head_major, source_sequence};
+    return h3_gpu_dispatch_1d(
+        gpu, @"h3_pack_bf16_head_major_source", (uint32_t)vector_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(source).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(destination).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }
 
@@ -1823,6 +2007,28 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         result.queryShape = queryShape;
         result.kvShape = kvShape;
         result.outputShape = outputShape;
+        if (getenv("H3_MPSGRAPH_EXECUTABLE")) {
+            MPSGraphShapedType *queryType = [[MPSGraphShapedType alloc]
+                initWithShape:queryShape dataType:dataType];
+            MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc]
+                initWithShape:headMajor ? headMajorKV : rowMajorKV
+                dataType:dataType];
+            @try {
+                result.executable = [graph
+                    compileWithDevice:[MPSGraphDevice
+                        deviceWithMTLDevice:gpu.device]
+                    feeds:@{result.query: queryType,
+                            result.key: kvType,
+                            result.value: kvType}
+                    targetTensors:@[result.output] targetOperations:nil
+                    compilationDescriptor:nil];
+                result.executable.options = MPSGraphOptionsNone;
+            } @catch (NSException *exception) {
+                if (getenv("H3_NAX_DIAGNOSTIC"))
+                    fprintf(stderr, "h3: SDPA executable compile failed: %s\\n",
+                            exception.reason.UTF8String);
+            }
+        }
         gpu.sdpaCache[cacheKey] = result;
         return result;
     }
@@ -1866,14 +2072,31 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
             cache.key: h3_gpu_graph_data(key, cache.kvShape, mps_dtype, 0),
             cache.value: h3_gpu_graph_data(value, cache.kvShape, mps_dtype, 0)
         };
+        MPSDataType outputType = packedFP16 == 3 ?
+            MPSDataTypeBFloat16 : mps_dtype;
         MPSGraphTensorData *outputData = h3_gpu_graph_data(
-            output, cache.outputShape,
-            packedFP16 == 3 ? MPSDataTypeBFloat16 : mps_dtype, 0);
-        NSDictionary *results = @{cache.output: outputData};
+            output, cache.outputShape, outputType, 0);
         @try {
-            [cache.graph encodeToCommandBuffer:command feeds:feeds
-                targetOperations:nil resultsDictionary:results
-                executionDescriptor:nil];
+            if (cache.executable) {
+                NSMutableArray<MPSGraphTensorData *> *inputs =
+                    [NSMutableArray array];
+                for (MPSGraphTensor *tensor in cache.executable.feedTensors) {
+                    if (tensor == cache.query)
+                        [inputs addObject:feeds[cache.query]];
+                    else if (tensor == cache.key)
+                        [inputs addObject:feeds[cache.key]];
+                    else if (tensor == cache.value)
+                        [inputs addObject:feeds[cache.value]];
+                }
+                [cache.executable encodeToCommandBuffer:command
+                    inputsArray:inputs resultsArray:@[outputData]
+                    executionDescriptor:nil];
+            } else {
+                NSDictionary *results = @{cache.output: outputData};
+                [cache.graph encodeToCommandBuffer:command feeds:feeds
+                    targetOperations:nil resultsDictionary:results
+                    executionDescriptor:nil];
+            }
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph SDPA failed: %@", exception.reason);
             return 0;
@@ -1955,7 +2178,18 @@ int h3_gpu_cross_sdpa_batched_fp16_head_major_storage(
                      uint32_t heads, uint32_t head_dim, float scale) {
     return h3_gpu_sdpa(opaque, output, query, key, value, batch,
                        query_sequence, kv_sequence, heads, head_dim, scale,
-                       H3_GPU_BF16, MPSDataTypeFloat16, 0, 0, 3);
+                       H3_GPU_BF16, MPSDataTypeFloat16, 0, 1, 2);
+}
+
+int h3_gpu_cross_sdpa_bf16_head_major_output(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t query_sequence,
+                     uint32_t kv_sequence, uint32_t heads,
+                     uint32_t head_dim, float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1,
+                       query_sequence, kv_sequence, heads, head_dim, scale,
+                       H3_GPU_BF16, MPSDataTypeBFloat16, 0, 1, 0);
 }
 
 int h3_gpu_vdn_gate_heads_bf16(h3_gpu *opaque, h3_gpu_tensor *heads,
@@ -1978,34 +2212,49 @@ int h3_gpu_vdn_gate_heads_bf16(h3_gpu *opaque, h3_gpu_tensor *heads,
         });
 }
 
-int h3_gpu_vdn_copy_gate_heads_bf16(
+int h3_gpu_vdn_copy_gate_heads_bf16_strided(
                      h3_gpu *opaque, h3_gpu_tensor *destination,
                      uint32_t destination_row,
                      const h3_gpu_tensor *source, uint32_t source_row,
                      const h3_gpu_tensor *logits, uint32_t logit_row,
                      uint32_t rows, uint32_t head_count, uint32_t head_dim,
-                     int source_is_fp16) {
+                     int source_is_fp16, uint32_t source_sequence) {
     H3GPU *gpu = GPU(opaque);
     size_t row_width = (size_t)head_count * head_dim;
     size_t vectors = (size_t)rows * head_count * (head_dim / 4);
+    if (source_is_fp16 >= 2 && !source_sequence)
+        source_sequence = rows;
+    size_t source_elements = source_is_fp16 == 2 ?
+        (((size_t)source_row * head_count + (head_count - 1)) *
+         source_sequence + rows) * head_dim :
+        source_is_fp16 == 3 ?
+        (((size_t)(head_count - 1) * source_sequence + source_row + rows) *
+        head_dim) :
+        ((size_t)source_row + rows) * row_width;
+    int source_ok = h3_gpu_require_bf16(gpu, source, source_elements,
+                                        @"VDN gated-copy source");
+    int destination_ok = h3_gpu_require_bf16(
+        gpu, destination, ((size_t)destination_row + rows) * row_width,
+        @"VDN gated-copy destination");
+    int logits_ok = h3_gpu_require_bf16(
+        gpu, logits, ((size_t)logit_row + rows) * head_count,
+        @"VDN gated-copy logits");
     if (!rows || !head_count || !head_dim || head_dim % 4 ||
-        vectors > UINT32_MAX ||
-        !h3_gpu_require_bf16(gpu, source,
-            ((size_t)source_row + rows) * row_width,
-            @"VDN gated-copy source") ||
-        !h3_gpu_require_bf16(gpu, destination,
-            ((size_t)destination_row + rows) * row_width,
-            @"VDN gated-copy destination") ||
-        !h3_gpu_require_bf16(gpu, logits,
-            ((size_t)logit_row + rows) * head_count,
-            @"VDN gated-copy logits")) return 0;
+        source_is_fp16 < 0 || source_is_fp16 > 3 ||
+        vectors > UINT32_MAX || !source_ok || !destination_ok || !logits_ok)
+        return 0;
     typedef struct {
         uint32_t destination_row, source_row, logit_row;
-        uint32_t rows, heads, head_dim;
+        uint32_t rows, heads, head_dim, source_layout, source_sequence;
     } args_type;
     args_type args = {destination_row, source_row, logit_row,
-                      rows, head_count, head_dim};
-    NSString *kernel = source_is_fp16 ?
+                      rows, head_count, head_dim,
+                      (uint32_t)source_is_fp16, source_sequence};
+    NSString *kernel = source_is_fp16 == 3 ?
+        @"h3_vdn_copy_gate_heads_bf16_head_major_bf16" :
+        source_is_fp16 == 2 ?
+        @"h3_vdn_copy_gate_heads_fp16_head_major_bf16" :
+        source_is_fp16 ?
         @"h3_vdn_copy_gate_heads_fp16_bf16" :
         @"h3_vdn_copy_gate_heads_bf16";
     return h3_gpu_dispatch_1d(
@@ -2016,6 +2265,89 @@ int h3_gpu_vdn_copy_gate_heads_bf16(
             [encoder setBuffer:TENSOR(logits).buffer offset:0 atIndex:2];
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
+}
+
+int h3_gpu_vdn_copy_gate_heads_bf16(
+                     h3_gpu *opaque, h3_gpu_tensor *destination,
+                     uint32_t destination_row,
+                     const h3_gpu_tensor *source, uint32_t source_row,
+                     const h3_gpu_tensor *logits, uint32_t logit_row,
+                     uint32_t rows, uint32_t head_count, uint32_t head_dim,
+                     int source_is_fp16) {
+    return h3_gpu_vdn_copy_gate_heads_bf16_strided(
+        opaque, destination, destination_row, source, source_row, logits,
+        logit_row, rows, head_count, head_dim, source_is_fp16,
+        source_is_fp16 == 2 ? rows : 0);
+}
+
+int h3_gpu_vdn_gate_quantize_int8_head_major(
+                     h3_gpu *opaque, h3_gpu_tensor *quantized_output,
+                     h3_gpu_tensor *quantized_scales,
+                     const h3_gpu_tensor *source,
+                     const h3_gpu_tensor *logits,
+                     uint32_t destination_row, uint32_t source_batch,
+                     uint32_t source_row, uint32_t logit_row,
+                     uint32_t rows, uint32_t head_count, uint32_t head_dim,
+                     int source_is_fp16, uint32_t source_sequence) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_dim = (size_t)head_count * head_dim;
+    size_t source_stop =
+        (((size_t)source_batch * head_count + (head_count - 1)) *
+         source_sequence + source_row + rows) * head_dim;
+    size_t output_stop = ((size_t)destination_row + rows) * input_dim;
+    if (!rows || head_count != 56 || head_dim != 128 ||
+        !source_sequence || source_is_fp16 < 0 || source_is_fp16 > 1 ||
+        source_row > UINT32_MAX - rows ||
+        source_row + rows > source_sequence ||
+        destination_row > UINT32_MAX - rows ||
+        logit_row > UINT32_MAX - rows ||
+        source_stop > TENSOR(source).elements ||
+        output_stop > TENSOR(quantized_output).elements ||
+        (size_t)logit_row + rows > TENSOR(logits).elements / head_count ||
+        (size_t)destination_row + rows > TENSOR(quantized_scales).elements ||
+        !h3_gpu_require_bf16(gpu, source, source_stop,
+                             @"VDN fused gate source") ||
+        !h3_gpu_require_bf16(gpu, logits,
+                             ((size_t)logit_row + rows) * head_count,
+                             @"VDN fused gate logits") ||
+        !h3_gpu_require_i8(gpu, quantized_output, output_stop,
+                           @"VDN fused gate int8 output") ||
+        !h3_gpu_require_f32(gpu, quantized_scales,
+                            (size_t)destination_row + rows,
+                            @"VDN fused gate scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    typedef struct {
+        uint32_t destination_row, source_batch, source_row, logit_row;
+        uint32_t rows, heads, head_dim, source_sequence;
+    } args_type;
+    args_type args = {destination_row, source_batch, source_row, logit_row,
+                      rows, head_count, head_dim, source_sequence};
+    NSString *pipeline_name = source_is_fp16 ?
+        @"h3_vdn_gate_quantize_fp16_head_major_int8" :
+        @"h3_vdn_gate_quantize_bf16_head_major_int8";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, pipeline_name);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+            @"device cannot dispatch fused VDN gate quantizer");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(source).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(logits).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(quantized_output).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(quantized_scales).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 typedef struct {
@@ -2038,7 +2370,10 @@ int h3_gpu_vdn_text_features_bf16(
     h3_vdn_feature_args args = {
         source_row, 1, rows, 1, rows, heads, head_dim, 0, 0
     };
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_text_features_bf16", rows, heads,
+    NSString *pipeline = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_TEXT_VEC4") ?
+        @"h3_vdn_text_features_vec4_bf16" : @"h3_vdn_text_features_bf16";
+    return h3_gpu_dispatch_2d(gpu, pipeline, rows, heads,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
@@ -2098,12 +2433,62 @@ int h3_gpu_vdn_spatial_feature_bf16(
         source_row, frames, height * width, height, width,
         heads, head_dim, stream, 0
     };
-    return h3_gpu_dispatch_1d(gpu, @"h3_vdn_spatial_feature_bf16",
-        (uint32_t)count, ^(id<MTLComputeCommandEncoder> encoder) {
+    int vec4 = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_SPATIAL_VEC4");
+    size_t dispatch_count = vec4 ? count / 4 : count;
+    return h3_gpu_dispatch_1d(gpu, vec4 ?
+        @"h3_vdn_spatial_feature_vec4_bf16" :
+        @"h3_vdn_spatial_feature_bf16", (uint32_t)dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(spatial).buffer offset:0 atIndex:2];
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_vdn_spatial_feature_bf16_pair(
+                     h3_gpu *opaque, h3_gpu_tensor *key_spatial,
+                     h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *grouped_qkv,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight,
+                     uint32_t source_row, uint32_t frames,
+                     uint32_t height, uint32_t width, uint32_t heads,
+                     uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * height * width;
+    size_t channels = (size_t)heads * head_dim;
+    size_t count = rows * channels;
+    size_t qkv = ((size_t)source_row + rows) * channels * 3;
+    if (!frames || !height || !width || !heads || !head_dim ||
+        count > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, grouped_qkv, qkv, @"VDN pair conv QKV") ||
+        !h3_gpu_require_bf16(gpu, key_weight, channels * 25,
+                             @"VDN pair K spatial weight") ||
+        !h3_gpu_require_bf16(gpu, value_weight, channels * 25,
+                             @"VDN pair V spatial weight") ||
+        !h3_gpu_require_bf16(gpu, key_spatial, count,
+                             @"VDN pair K spatial output") ||
+        !h3_gpu_require_bf16(gpu, value_spatial, count,
+                             @"VDN pair V spatial output")) return 0;
+    h3_vdn_feature_args args = {
+        source_row, frames, height * width, height, width,
+        heads, head_dim, 0, 0
+    };
+    int vec4 = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_SPATIAL_VEC4");
+    size_t dispatch_count = vec4 ? count / 4 : count;
+    return h3_gpu_dispatch_1d(gpu, vec4 ?
+        @"h3_vdn_spatial_feature_pair_vec4_bf16" :
+        @"h3_vdn_spatial_feature_pair_bf16", (uint32_t)dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(grouped_qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key_weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(value_weight).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(key_spatial).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(value_spatial).buffer offset:0 atIndex:4];
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
         });
 }
 
@@ -2139,23 +2524,128 @@ int h3_gpu_vdn_temporal_feature_bf16(
         });
 }
 
-int h3_gpu_vdn_frame_mean_f32(
-                     h3_gpu *opaque, h3_gpu_tensor *mean,
-                     const h3_gpu_tensor *input, uint32_t frames,
-                     uint32_t tokens_per_frame, uint32_t width) {
+int h3_gpu_vdn_temporal_feature_bf16_pair(
+                     h3_gpu *opaque, h3_gpu_tensor *key_feature,
+                     h3_gpu_tensor *value_feature,
+                     const h3_gpu_tensor *key_spatial,
+                     const h3_gpu_tensor *value_spatial,
+                     const h3_gpu_tensor *key_weight,
+                     const h3_gpu_tensor *value_weight, uint32_t frames,
+                     uint32_t tokens_per_frame, uint32_t heads,
+                     uint32_t head_dim) {
     H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * tokens_per_frame;
+    size_t count = rows * heads * head_dim;
+    if (!frames || !tokens_per_frame || !heads || !head_dim ||
+        rows > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, key_spatial, count,
+                             @"VDN pair K temporal input") ||
+        !h3_gpu_require_bf16(gpu, value_spatial, count,
+                             @"VDN pair V temporal input") ||
+        !h3_gpu_require_bf16(gpu, key_weight, (size_t)heads * head_dim * 5,
+                             @"VDN pair K temporal weight") ||
+        !h3_gpu_require_bf16(gpu, value_weight, (size_t)heads * head_dim * 5,
+                             @"VDN pair V temporal weight") ||
+        !h3_gpu_require_bf16(gpu, key_feature, count,
+                             @"VDN pair K temporal output") ||
+        !h3_gpu_require_bf16(gpu, value_feature, count,
+                             @"VDN pair V temporal output")) return 0;
+    h3_vdn_feature_args args = {
+        0, frames, tokens_per_frame, 0, 0,
+        heads, head_dim, 0, 1
+    };
+    int vec4 = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_TEMPORAL_VEC4");
+    return h3_gpu_dispatch_2d(gpu, vec4 ?
+        @"h3_vdn_temporal_feature_pair_vec4_bf16" :
+        @"h3_vdn_temporal_feature_pair_bf16", (uint32_t)rows, heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(key_spatial).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(value_spatial).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(key_weight).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(value_weight).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(key_feature).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(value_feature).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+int h3_gpu_vdn_frame_mean_f32_offset(
+                     h3_gpu *opaque, h3_gpu_tensor *mean,
+                     const h3_gpu_tensor *input, size_t input_offset,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)frames * tokens_per_frame * width;
+    if (input_offset > SIZE_MAX - count ||
+        input_offset > SIZE_MAX / sizeof(uint16_t)) {
+        h3_gpu_set_error(gpu, @"VDN frame input offset is out of range");
+        return 0;
+    }
     if (!frames || !tokens_per_frame || !width ||
-        !h3_gpu_require_bf16(gpu, input,
-            (size_t)frames * tokens_per_frame * width, @"VDN frame input") ||
+        !h3_gpu_require_bf16(gpu, input, input_offset + count,
+                             @"VDN frame input") ||
         !h3_gpu_require_f32(gpu, mean, (size_t)frames * width,
                             @"VDN frame mean")) return 0;
     typedef struct { uint32_t frames, tokens, width; } args_type;
     args_type args = {frames, tokens_per_frame, width};
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_frame_mean_f32", width, frames,
+    int vec4 = width % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_FRAME_MEAN_VEC4");
+    return h3_gpu_dispatch_2d(gpu, vec4 ?
+        @"h3_vdn_frame_mean_vec4_f32" : @"h3_vdn_frame_mean_f32",
+        vec4 ? width / 4 : width, frames,
         ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(input).buffer
+                         offset:input_offset * sizeof(uint16_t) atIndex:0];
             [encoder setBuffer:TENSOR(mean).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_vdn_frame_mean_f32(
+                     h3_gpu *opaque, h3_gpu_tensor *mean,
+                     const h3_gpu_tensor *input, uint32_t frames,
+                     uint32_t tokens_per_frame, uint32_t width) {
+    return h3_gpu_vdn_frame_mean_f32_offset(
+        opaque, mean, input, 0, frames, tokens_per_frame, width);
+}
+
+int h3_gpu_vdn_frame_mean_int8_f32_offset(
+                     h3_gpu *opaque, h3_gpu_tensor *mean,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *input_scales,
+                     uint32_t input_row, uint32_t frames,
+                     uint32_t tokens_per_frame, uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * tokens_per_frame;
+    size_t offset = (size_t)input_row * width;
+    size_t count = rows * width;
+    if (!frames || !tokens_per_frame || !width ||
+        input_row > UINT32_MAX - rows ||
+        offset > SIZE_MAX - count ||
+        !h3_gpu_require_i8(gpu, input, offset + count,
+                            @"VDN int8 frame input") ||
+        !h3_gpu_require_f32(gpu, input_scales, input_row + rows,
+                             @"VDN int8 frame scales") ||
+        !h3_gpu_require_f32(gpu, mean, (size_t)frames * width,
+                            @"VDN frame mean")) return 0;
+    if (width % 4) {
+        h3_gpu_set_error(gpu,
+            @"VDN int8 frame mean requires a width divisible by four");
+        return 0;
+    }
+    typedef struct { uint32_t frames, tokens, width; } args_type;
+    args_type args = {frames, tokens_per_frame, width};
+    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_frame_mean_int8_vec4_f32",
+        width / 4, frames,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer
+                         offset:offset * sizeof(int8_t) atIndex:0];
+            [encoder setBuffer:TENSOR(input_scales).buffer
+                         offset:(NSUInteger)input_row * sizeof(float)
+                         atIndex:1];
+            [encoder setBuffer:TENSOR(mean).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
 
@@ -2175,12 +2665,58 @@ int h3_gpu_vdn_linear_f32_bf16(
                             @"VDN F32 linear output")) return 0;
     typedef struct { uint32_t rows, input_dim, output_dim; } args_type;
     args_type args = {rows, input_dim, output_dim};
-    return h3_gpu_dispatch_2d(gpu, @"h3_vdn_linear_f32_bf16",
-        output_dim, rows, ^(id<MTLComputeCommandEncoder> encoder) {
+    int kvec4 = input_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_LINEAR_KVEC4");
+    return h3_gpu_dispatch_2d(gpu, kvec4 ?
+        @"h3_vdn_linear_f32_bf16_kvec4" : @"h3_vdn_linear_f32_bf16",
+        output_dim, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_vdn_linear_alpha_f32_bf16(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *weight,
+                     const h3_gpu_tensor *dt_bias,
+                     const h3_gpu_tensor *a_log,
+                     uint32_t rows, uint32_t input_dim,
+                     uint32_t output_dim, uint32_t heads,
+                     uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t output_elements = (size_t)rows * output_dim;
+    if (!rows || !input_dim || !output_dim || !heads || !head_dim ||
+        output_dim != heads * head_dim ||
+        !h3_gpu_require_f32(gpu, input, (size_t)rows * input_dim,
+                            @"VDN fused alpha input") ||
+        !h3_gpu_require_bf16(gpu, weight, (size_t)output_dim * input_dim,
+                             @"VDN fused alpha weight") ||
+        !h3_gpu_require_bf16(gpu, dt_bias, output_dim,
+                             @"VDN fused alpha bias") ||
+        !h3_gpu_require_bf16(gpu, a_log, heads,
+                             @"VDN fused alpha log") ||
+        !h3_gpu_require_f32(gpu, output, output_elements,
+                            @"VDN fused alpha output")) return 0;
+    typedef struct {
+        uint32_t rows, input_dim, output_dim, heads, head_dim;
+    } args_type;
+    args_type args = {rows, input_dim, output_dim, heads, head_dim};
+    int kvec4 = input_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_LINEAR_KVEC4");
+    return h3_gpu_dispatch_2d(gpu, kvec4 ?
+        @"h3_vdn_linear_alpha_f32_bf16_kvec4" :
+        @"h3_vdn_linear_alpha_f32_bf16", output_dim, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(dt_bias).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(a_log).buffer offset:0 atIndex:4];
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
         });
 }
 
@@ -2200,7 +2736,10 @@ int h3_gpu_vdn_alpha_f32(
         !h3_gpu_require_bf16(gpu, a_log, heads, @"VDN alpha log")) return 0;
     typedef struct { uint32_t frames, heads, head_dim; } args_type;
     args_type args = {frames, heads, head_dim};
-    return h3_gpu_dispatch_1d(gpu, @"h3_vdn_alpha_f32", (uint32_t)count,
+    int vec4 = head_dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_ALPHA_VEC4");
+    return h3_gpu_dispatch_1d(gpu, vec4 ? @"h3_vdn_alpha_vec4_f32" :
+        @"h3_vdn_alpha_f32", (uint32_t)(vec4 ? count / 4 : count),
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(dt_bias).buffer offset:0 atIndex:1];
@@ -2268,6 +2807,8 @@ static H3VDNStats *h3_gpu_vdn_stats_graph(H3GPU *gpu, uint32_t frames,
                         stats.beta: betaType}
                 targetTensors:@[stats.a, stats.b] targetOperations:nil
                 compilationDescriptor:nil];
+            if (stats.executable)
+                stats.executable.options = MPSGraphOptionsNone;
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"cannot compile VDN statistics: %@",
                              exception.reason);
@@ -2484,6 +3025,72 @@ int h3_gpu_vdn_solve_f32(
         !h3_gpu_require_f32(gpu, solution, systems, @"VDN transition") ||
         !h3_gpu_require_f32(gpu, alpha, batches * dim, @"VDN solve alpha"))
         return 0;
+    if (getenv("H3_VDN_MPS_CHOLESKY")) {
+        typedef struct { uint32_t batches, dim; } args_type;
+        args_type args = {(uint32_t)batches, dim};
+        if (!h3_gpu_dispatch_1d(
+                gpu, @"h3_vdn_prepare_solve_f32", (uint32_t)matrices,
+                ^(id<MTLComputeCommandEncoder> encoder) {
+                    [encoder setBuffer:TENSOR(a).buffer offset:0 atIndex:0];
+                    [encoder setBuffer:TENSOR(rhs).buffer offset:0 atIndex:1];
+                    [encoder setBytes:&args length:sizeof(args) atIndex:2];
+                })) return 0;
+        @autoreleasepool {
+            NSUInteger rowBytes = (NSUInteger)dim * sizeof(float);
+            NSUInteger matrixBytes = (NSUInteger)dim * rowBytes;
+            MPSMatrixDescriptor *descriptor = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:dim columns:dim matrices:batches
+                rowBytes:rowBytes matrixBytes:matrixBytes
+                dataType:MPSDataTypeFloat32];
+            MPSMatrix *matrix = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(a).buffer offset:0 descriptor:descriptor];
+            MPSMatrix *identity = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(rhs).buffer offset:0 descriptor:descriptor];
+            MPSMatrix *inverse = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(solution).buffer offset:0
+                descriptor:descriptor];
+            MPSMatrixDecompositionCholesky *decomposition =
+                [[MPSMatrixDecompositionCholesky alloc]
+                    initWithDevice:gpu.device lower:YES order:dim];
+            decomposition.batchSize = batches;
+            [decomposition encodeToCommandBuffer:gpu.command
+                sourceMatrix:matrix resultMatrix:matrix status:nil];
+            MPSMatrixSolveCholesky *solve =
+                [[MPSMatrixSolveCholesky alloc]
+                    initWithDevice:gpu.device upper:NO order:dim
+                    numberOfRightHandSides:dim];
+            solve.batchSize = batches;
+            [solve encodeToCommandBuffer:gpu.command sourceMatrix:matrix
+                rightHandSideMatrix:identity solutionMatrix:inverse];
+
+            MPSMatrix *injectionMatrix = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(injection).buffer offset:0
+                descriptor:descriptor];
+            MPSMatrix *applied = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(solution).buffer
+                offset:(NSUInteger)batches * matrixBytes descriptor:descriptor];
+            MPSMatrixMultiplication *multiply = [[MPSMatrixMultiplication alloc]
+                initWithDevice:gpu.device transposeLeft:NO transposeRight:NO
+                resultRows:dim resultColumns:dim interiorColumns:dim
+                alpha:1.0 beta:0.0];
+            multiply.batchSize = batches;
+            [multiply encodeToCommandBuffer:gpu.command
+                leftMatrix:injectionMatrix rightMatrix:inverse
+                resultMatrix:applied];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches += 3;
+        gpu.stats = stats;
+        return h3_gpu_dispatch_1d(gpu, @"h3_vdn_pack_solve_f32",
+                                  (uint32_t)matrices,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:3];
+                [encoder setBytes:&args length:sizeof(args) atIndex:4];
+            });
+    }
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, @"h3_vdn_cholesky_solve_f32");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
@@ -2562,6 +3169,34 @@ int h3_gpu_vdn_scale_f32(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_vdn_decay_f32(
+                     h3_gpu *opaque, h3_gpu_tensor *before_decay,
+                     h3_gpu_tensor *after_decay,
+                     const h3_gpu_tensor *alpha,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)frames * heads * dim;
+    if (!frames || !heads || !dim || count > UINT32_MAX ||
+        !h3_gpu_require_f32(gpu, alpha, count, @"VDN decay alpha") ||
+        !h3_gpu_require_f32(gpu, before_decay, count,
+                            @"VDN before-decay output") ||
+        !h3_gpu_require_f32(gpu, after_decay, count,
+                            @"VDN after-decay output")) return 0;
+    typedef struct { uint32_t frames, heads, dim; } args_type;
+    args_type args = {frames, heads, dim};
+    int vec4 = dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_DECAY_VEC4");
+    size_t dispatch_count = vec4 ? count / 4 : count;
+    return h3_gpu_dispatch_1d(gpu, vec4 ? @"h3_vdn_decay_vec4_f32" :
+        @"h3_vdn_decay_f32", (uint32_t)dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(before_decay).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(after_decay).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
 
@@ -2679,6 +3314,50 @@ int h3_gpu_vdn_gather_state_bf16(
         });
 }
 
+int h3_gpu_vdn_gather_state_bf16_decay(
+                     h3_gpu *opaque, h3_gpu_tensor *state,
+                     const h3_gpu_tensor *prefix,
+                     const h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *text_state,
+                     const h3_gpu_tensor *before_decay,
+                     const h3_gpu_tensor *after_decay,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t matrices = (size_t)frames * heads * dim * dim;
+    size_t alpha_elements = (size_t)frames * heads * dim;
+    if (!frames || !heads || !dim || matrices > UINT32_MAX ||
+        !h3_gpu_require_f32(gpu, prefix, matrices, @"VDN gather prefix") ||
+        !h3_gpu_require_f32(gpu, suffix, matrices, @"VDN gather suffix") ||
+        !h3_gpu_require_f32(gpu, alpha, alpha_elements, @"VDN gather alpha") ||
+        !h3_gpu_require_f32(gpu, text_state, (size_t)heads * dim * dim,
+                            @"VDN gather text") ||
+        !h3_gpu_require_f32(gpu, before_decay, alpha_elements,
+                            @"VDN before decay") ||
+        !h3_gpu_require_f32(gpu, after_decay, alpha_elements,
+                            @"VDN after decay") ||
+        !h3_gpu_require_bf16(gpu, state, matrices,
+                             @"VDN gathered state")) return 0;
+    typedef struct { uint32_t frames, heads, dim; } args_type;
+    args_type args = {frames, heads, dim};
+    int vec4 = dim % 4 == 0 &&
+        !getenv("H3_DISABLE_VDN_GATHER_VEC4");
+    size_t dispatch_count = vec4 ? matrices / 4 : matrices;
+    return h3_gpu_dispatch_1d(gpu, vec4 ?
+        @"h3_vdn_gather_state_bf16_decay_vec4" :
+        @"h3_vdn_gather_state_bf16_decay", (uint32_t)dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(text_state).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(before_decay).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(after_decay).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(state).buffer offset:0 atIndex:6];
+            [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        });
+}
+
 static H3VDNReadout *h3_gpu_vdn_readout_graph(H3GPU *gpu, uint32_t batches,
                                                uint32_t tokens, uint32_t dim) {
     NSString *key = [NSString stringWithFormat:@"%u:%u:%u",
@@ -2712,6 +3391,8 @@ static H3VDNReadout *h3_gpu_vdn_readout_graph(H3GPU *gpu, uint32_t batches,
                 feeds:@{readout.query: queryType, readout.state: stateType}
                 targetTensors:@[readout.output] targetOperations:nil
                 compilationDescriptor:nil];
+            if (readout.executable)
+                readout.executable.options = MPSGraphOptionsNone;
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"cannot compile VDN readout: %@",
                              exception.reason);
@@ -4197,18 +4878,27 @@ int h3_gpu_quantize_weight_int8_padded(h3_gpu *opaque,
         1.0f, @"BF16 padded weight to quantize");
 }
 
-int h3_gpu_linear_int8_56_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+int h3_gpu_linear_int8_56_bf16_offset(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
                             const h3_gpu_tensor *input,
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
                             const h3_gpu_tensor *bias,
-                            uint32_t rows, uint32_t input_dim,
-                            int input_is_quantized) {
+                            uint32_t input_row, uint32_t rows,
+                            uint32_t input_dim, int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
     if (rows > UINT32_MAX - 127u) return 0;
     uint32_t padded_rows = (rows + 127u) & ~127u;
+    size_t input_offset = (size_t)input_row * input_dim;
+    size_t input_count = (size_t)rows * input_dim;
+    size_t quantized_count = (size_t)padded_rows * input_dim;
+    if (input_row && !input_is_quantized) {
+        h3_gpu_set_error(gpu,
+            @"unquantized VDN int8 gate slices are not supported");
+        return 0;
+    }
     if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
         !h3_gpu_require_i8(gpu, weight, (size_t)64 * input_dim,
                            @"VDN int8 gate weight") ||
@@ -4220,10 +4910,13 @@ int h3_gpu_linear_int8_56_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                       @"VDN int8 gate bias")) ||
         (input_is_quantized &&
          (!h3_gpu_require_i8(gpu, quantized_input,
-                             (size_t)padded_rows * input_dim,
+                             input_offset + quantized_count,
                              @"prequantized VDN int8 gate input") ||
-          !h3_gpu_require_f32(gpu, input_scales, padded_rows,
+          !h3_gpu_require_f32(gpu, input_scales, input_row + padded_rows,
                               @"prequantized VDN int8 gate scales"))) ||
+        (!input_is_quantized &&
+         !h3_gpu_require_bf16(gpu, input, input_offset + input_count,
+                              @"VDN int8 gate input")) ||
         !h3_gpu_require_command(gpu) ||
         (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
@@ -4235,11 +4928,15 @@ int h3_gpu_linear_int8_56_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     const h3_gpu_tensor *bias_buffer = bias ? bias : output;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
-            [gpu.command computeCommandEncoder];
+        [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:TENSOR(quantized_input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(quantized_input).buffer
+                     offset:(input_is_quantized ?
+                             input_offset * sizeof(int8_t) : 0) atIndex:0];
         [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
-        [encoder setBuffer:TENSOR(input_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(input_scales).buffer
+                     offset:(input_is_quantized ?
+                             (NSUInteger)input_row * sizeof(float) : 0) atIndex:2];
         [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
@@ -4254,6 +4951,20 @@ int h3_gpu_linear_int8_56_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
+int h3_gpu_linear_int8_56_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            const h3_gpu_tensor *bias,
+                            uint32_t rows, uint32_t input_dim,
+                            int input_is_quantized) {
+    return h3_gpu_linear_int8_56_bf16_offset(
+        opaque, output, quantized_input, input_scales, input, weight,
+        weight_scales, bias, 0, rows, input_dim, input_is_quantized);
+}
+
 static int h3_gpu_linear_int8_bf16_layout(
                             h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
@@ -4265,11 +4976,20 @@ static int h3_gpu_linear_int8_bf16_layout(
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales,
+                            uint32_t input_row,
                             BOOL inputIsQuantized,
                             BOOL headMajorInput, uint32_t heads,
                             uint32_t headDim) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
+    size_t input_offset = (size_t)input_row * input_dim;
+    size_t input_count = (size_t)rows * input_dim;
+    size_t quantized_count = (size_t)padded_rows * input_dim;
+    if (input_row && !inputIsQuantized) {
+        h3_gpu_set_error(gpu,
+            @"unquantized int8 linear slices are not supported");
+        return 0;
+    }
     if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
         output_dim % 128 ||
         !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
@@ -4282,10 +5002,14 @@ static int h3_gpu_linear_int8_bf16_layout(
                              @"int8 linear output") ||
         (inputIsQuantized &&
          (!h3_gpu_require_i8(gpu, quantized_input,
-                             (size_t)padded_rows * input_dim,
+                             input_offset + quantized_count,
                              @"prequantized int8 linear input") ||
-          !h3_gpu_require_f32(gpu, input_scales, padded_rows,
+          !h3_gpu_require_f32(gpu, input_scales,
+                              (size_t)input_row + padded_rows,
                               @"prequantized int8 linear scales"))) ||
+        (!inputIsQuantized &&
+         !h3_gpu_require_bf16(gpu, input, input_offset + input_count,
+                              @"int8 linear input")) ||
         !h3_gpu_require_command(gpu)) return 0;
     if (headMajorInput) {
         if (use_slower_uncached_int8_scales || heads * headDim != input_dim ||
@@ -4313,11 +5037,15 @@ static int h3_gpu_linear_int8_bf16_layout(
     const h3_gpu_tensor *bias_buffer = bias ? bias : output;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
-            [gpu.command computeCommandEncoder];
+        [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:TENSOR(quantized_input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(quantized_input).buffer
+                     offset:(inputIsQuantized ?
+                             input_offset * sizeof(int8_t) : 0) atIndex:0];
         [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
-        [encoder setBuffer:TENSOR(input_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(input_scales).buffer
+                     offset:(inputIsQuantized ?
+                             (NSUInteger)input_row * sizeof(float) : 0) atIndex:2];
         [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
@@ -4346,7 +5074,7 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, NULL, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, NO, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0);
 }
 
 int h3_gpu_linear_int8_prequantized_bf16(
@@ -4361,7 +5089,22 @@ int h3_gpu_linear_int8_prequantized_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, NULL, weight,
         weight_scales, NULL, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, YES, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, YES, NO, 0, 0);
+}
+
+int h3_gpu_linear_int8_prequantized_bf16_offset(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t input_row, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim,
+                            int use_slower_uncached_int8_scales) {
+    return h3_gpu_linear_int8_bf16_layout(
+        opaque, output, quantized_input, input_scales, NULL, weight,
+        weight_scales, NULL, rows, input_dim, output_dim,
+        use_slower_uncached_int8_scales, input_row, YES, NO, 0, 0);
 }
 
 int h3_gpu_linear_int8_bias_bf16(
@@ -4378,7 +5121,7 @@ int h3_gpu_linear_int8_bias_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, bias, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, NO, NO, 0, 0);
+        use_slower_uncached_int8_scales, 0, NO, NO, 0, 0);
 }
 
 int h3_gpu_linear_int8_head_major_bf16(
@@ -4393,7 +5136,7 @@ int h3_gpu_linear_int8_head_major_bf16(
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, NULL, rows, heads * head_dim, output_dim, 0, NO, YES,
-        heads, head_dim);
+        0, heads, head_dim);
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -5242,11 +5985,12 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
     return 1;
 }
 
-int h3_gpu_grouped_qkv_linear_rope_int8(
+static int h3_gpu_grouped_qkv_linear_rope_int8_layout(
                                  h3_gpu *opaque,
                                  h3_gpu_tensor *query,
                                  h3_gpu_tensor *key,
                                  h3_gpu_tensor *value,
+                                 h3_gpu_tensor *raw_qkv,
                                  h3_gpu_tensor *quantized_input,
                                  h3_gpu_tensor *input_scales,
                                  const h3_gpu_tensor *input,
@@ -5262,7 +6006,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int input_is_quantized,
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
-                                 int use_slower_uncached_int8_scales) {
+                                 int use_slower_uncached_int8_scales,
+                                 int output_head_major) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -5293,12 +6038,20 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         !h3_gpu_require_bf16(gpu, query, projected, @"int8 query") ||
         !h3_gpu_require_bf16(gpu, key, projected, @"int8 key") ||
         !h3_gpu_require_bf16(gpu, value, projected, @"int8 value") ||
+        (raw_qkv && !h3_gpu_require_bf16(
+            gpu, raw_qkv, (size_t)rows * inner * 3,
+            @"int8 raw QKV")) ||
         !h3_gpu_require_command(gpu)) return 0;
     if (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
             input_dim, 1.0f, @"int8 QKV input")) return 0;
     BOOL fused_rope = !use_slower_unfused_qkv_rope &&
         getenv("H3_DISABLE_FUSED_INT8_QKV_ROPE") == NULL;
+    if (raw_qkv && !fused_rope) {
+        h3_gpu_set_error(gpu,
+            @"VDN fused int8 QKV requires the fused norm/RoPE epilogue");
+        return 0;
+    }
     BOOL local_scales = fused_rope && rows > 2048 &&
         !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_QKV_LOCAL_SCALES") == NULL;
@@ -5335,7 +6088,9 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     if (fused_rope && getenv("H3_DISABLE_VECTOR_QKV_ROPE") == NULL)
         rms_mode |= 4u;
     qkv_project_rope_args args = {
-        rows, input_dim, heads, head_dim, rope_half, rms_mode, epsilon
+        rows, input_dim, heads, head_dim, rope_half,
+        rms_mode | (output_head_major ? 8u : 0u) |
+            (raw_qkv ? 16u : 0u), epsilon
     };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
@@ -5349,11 +6104,14 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:5];
         [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:6];
         if (fused_rope) {
-            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:7];
-            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:8];
-            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:9];
-            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:10];
-            [encoder setBytes:&args length:sizeof(args) atIndex:11];
+            [encoder setBuffer:(raw_qkv ? TENSOR(raw_qkv).buffer :
+                                TENSOR(query).buffer)
+                       offset:0 atIndex:7];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:8];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:9];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:10];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:11];
+            [encoder setBytes:&args length:sizeof(args) atIndex:12];
         } else {
             [encoder setBytes:&args length:sizeof(args) atIndex:7];
         }
@@ -5379,8 +6137,69 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches += fused_rope ? 1 : 2;
     gpu.stats = stats;
-    gpu.headMajorSDPAInputs = YES;
+    gpu.headMajorSDPAInputs = output_head_major != 0;
     return 1;
+}
+
+int h3_gpu_grouped_qkv_linear_rope_int8(
+                                 h3_gpu *opaque,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *quantized_input,
+                                 h3_gpu_tensor *input_scales,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon,
+                                 int input_is_quantized,
+                                 int use_slower_unfused_qkv_rope,
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales) {
+    return h3_gpu_grouped_qkv_linear_rope_int8_layout(
+        opaque, query, key, value, NULL, quantized_input, input_scales, input,
+        weight, weight_scales, q_norm, k_norm, rope_cos, rope_sin, rows,
+        input_dim, heads, head_dim, rope_half, epsilon, input_is_quantized,
+        use_slower_unfused_qkv_rope, use_slower_scalar_qkv_rms,
+        use_slower_uncached_int8_scales, 1);
+}
+
+int h3_gpu_grouped_qkv_linear_rope_int8_vdn(
+                                 h3_gpu *opaque,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *raw_qkv,
+                                 h3_gpu_tensor *quantized_input,
+                                 h3_gpu_tensor *input_scales,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon,
+                                 int input_is_quantized,
+                                 int use_slower_unfused_qkv_rope,
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales) {
+    int output_head_major = getenv("H3_VDN_HEAD_MAJOR_QKV") != NULL &&
+                            getenv("H3_DISABLE_HEAD_MAJOR_SDPA") == NULL;
+    return h3_gpu_grouped_qkv_linear_rope_int8_layout(
+        opaque, query, key, value, raw_qkv, quantized_input, input_scales, input,
+        weight, weight_scales, q_norm, k_norm, rope_cos, rope_sin, rows,
+        input_dim, heads, head_dim, rope_half, epsilon, input_is_quantized,
+        use_slower_unfused_qkv_rope, use_slower_scalar_qkv_rms,
+        use_slower_uncached_int8_scales, output_head_major);
 }
 
 int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

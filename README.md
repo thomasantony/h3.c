@@ -141,6 +141,32 @@ The same 35-block core benchmark completed in 26.71 seconds with this preset,
 36% below the original 41.73 seconds. Its FP16 and int8 rounding changes output
 bytes, so use the preceding BF16 path when numerical closeness is the priority.
 
+For a more aggressive 35-block run, enable the fused VDN producer, direct
+head-major QKV path, and branch-local quantizer. These keep the same arbitrary
+sequence/window planner but intentionally trade additional FP16/int8 rounding
+for throughput:
+
+```sh
+H3_BENCH_SYNTHETIC_TEXT=1 \
+H3_BENCH_VDN=./vdn-checkpoints/stage-dmd-step-250 \
+H3_BENCH_LAYERS=35 H3_BENCH_FORWARD_COUNT=1 \
+H3_BENCH_INT8_ROW_FC2=1 H3_VDN_INT8_ATTENTION_OUT=1 \
+H3_VDN_FP16_STATS=1 H3_VDN_FP16_HEAD_MAJOR_SDPA=1 \
+H3_VDN_FUSED_INT8_QKV=1 H3_VDN_FUSED_INT8_QKV_INPUT=1 \
+H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
+H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
+H3_VDN_FUSED_KV_CONV=1 H3_VDN_PRECOMPUTE_DECAY=1 \
+H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_MPS_CHOLESKY=1 \
+H3_MPSGRAPH_EXECUTABLE=1 \
+./h3_dit_bench_full MiniMax-H3
+```
+
+The fused gate quantizer writes the attention-output int8 rows directly and
+avoids a full BF16 staging pass (it reserves an INNER-wide int8 scratch arena
+so the following VDN beta projections can still reuse their QKV quantization).
+`H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
+and timing against the balanced preset before using it for production output.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps
