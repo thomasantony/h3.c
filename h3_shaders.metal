@@ -2397,6 +2397,101 @@ kernel void h3_vdn_epilogue_vec4_bf16(
     }
 }
 
+/* Fused VDN epilogue + row-wise int8 quantization.  H3's VDN shape is fixed
+ * at 56 heads x 128 dimensions (7,168 values per token row).  Four lanes own
+ * each head's 32 dimensions while the first lane of every head computes the
+ * same per-head RMS inverse as the standalone epilogue.  Values are retained
+ * as BF16 bits in threadgroup memory, exactly matching the standalone
+ * epilogue followed by the dynamic row quantizer. */
+kernel void h3_vdn_epilogue_quantize_int8(
+                                device const ushort *readout [[buffer(0)]],
+                                device const ushort *weight [[buffer(1)]],
+                                device const ushort *gate [[buffer(2)]],
+                                device char4 *output [[buffer(3)]],
+                                device float *scales [[buffer(4)]],
+                                constant vdn_epilogue_args &args [[buffer(5)]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                ushort simdgroup
+                                    [[simdgroup_index_in_threadgroup]],
+                                ushort lane [[thread_index_in_simdgroup]],
+                                uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint HEADS = 56;
+    constexpr uint DIM = 128;
+    constexpr uint TOTAL = HEADS * DIM;
+    if (row >= args.frames * args.tokens) return;
+    threadgroup float head_inverse[HEADS];
+    threadgroup ushort values[TOTAL];
+    threadgroup float max_scratch[8];
+    uint frame = row / args.tokens;
+    uint token = row - frame * args.tokens;
+    if (tid < HEADS) {
+        uint source = ((frame * HEADS + tid) * args.tokens + token) * DIM;
+        device const ushort4 *readout4 =
+            reinterpret_cast<device const ushort4 *>(readout + source);
+        float sum = 0.0f;
+        for (uint d = 0; d < DIM; d += 4) {
+            float4 value = h3_bf16x4_to_f32(readout4[d / 4]);
+            sum = fma(value.x, value.x, sum);
+            sum = fma(value.y, value.y, sum);
+            sum = fma(value.z, value.z, sum);
+            sum = fma(value.w, value.w, sum);
+        }
+        head_inverse[tid] = rsqrt(sum / float(DIM) + args.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = 0.0f;
+    if (tid < HEADS * 4) {
+        uint head = tid / 4;
+        uint lane_head = tid & 3u;
+        uint d0 = lane_head * 32u;
+        uint source = ((frame * HEADS + head) * args.tokens + token) * DIM;
+        uint gate_base = row * TOTAL + head * DIM;
+        device const ushort4 *readout4 =
+            reinterpret_cast<device const ushort4 *>(readout + source);
+        device const ushort4 *weight4 =
+            reinterpret_cast<device const ushort4 *>(weight + d0);
+        device const ushort4 *gate4 =
+            reinterpret_cast<device const ushort4 *>(gate + gate_base + d0);
+        threadgroup ushort4 *values4 =
+            reinterpret_cast<threadgroup ushort4 *>(values + head * DIM + d0);
+        float inverse = head_inverse[head];
+        for (uint d = 0; d < 32; d += 4) {
+            float4 value = h3_bf16x4_to_f32(readout4[(d0 + d) / 4]) *
+                           inverse * h3_bf16x4_to_f32(weight4[d / 4]);
+            float4 logit = h3_bf16x4_to_f32(gate4[d / 4]);
+            float4 sigmoid = 1.0f / (1.0f + exp(-logit));
+            ushort4 rounded = h3_f32x4_to_bf16(value * sigmoid);
+            values4[d / 4] = rounded;
+            float4 rounded_value = h3_bf16x4_to_f32(rounded);
+            local_max = max(local_max,
+                max(max(fabs(rounded_value.x), fabs(rounded_value.y)),
+                    max(fabs(rounded_value.z), fabs(rounded_value.w))));
+        }
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, max_scratch, simdgroup, lane);
+    float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0)
+        scales[row] = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    if (tid < HEADS * 4) {
+        uint head = tid / 4;
+        uint lane_head = tid & 3u;
+        uint d0 = lane_head * 32u;
+        threadgroup const ushort4 *values4 =
+            reinterpret_cast<threadgroup const ushort4 *>(
+                values + head * DIM + d0);
+        device char4 *output4 = output + row * (TOTAL / 4) +
+                                (head * DIM + d0) / 4;
+        for (uint d = 0; d < 32; d += 4) {
+            int4 quantized = int4(rint(
+                h3_bf16x4_to_f32(values4[d / 4]) * inverse));
+            output4[d / 4] = char4(clamp(quantized,
+                                         int4(-127), int4(127)));
+        }
+    }
+}
+
 struct vdn_add_args { uint destination_row; uint rows; uint width; };
 kernel void h3_vdn_add_projected_bf16(
                                 device ushort *destination [[buffer(0)]],

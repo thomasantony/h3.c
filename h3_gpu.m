@@ -493,6 +493,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_gather_state_fp16_decay_vec4",
             @"h3_vdn_gather_state_bf16_decay_vec4",
             @"h3_vdn_epilogue_bf16", @"h3_vdn_epilogue_vec4_bf16",
+            @"h3_vdn_epilogue_quantize_int8",
             @"h3_vdn_add_projected_bf16", @"h3_vdn_add_projected_vec4_bf16",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
             @"h3_linear_f32_tiled_bf16_map",
@@ -3959,6 +3960,69 @@ int h3_gpu_vdn_epilogue_bf16(
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         });
+}
+
+/* The int8 VDN output projection consumes a row-major dynamically quantized
+ * copy of the epilogue output.  For the fixed H3 shape (56 heads x 128
+ * dimensions), one 256-thread group owns one token row: the first 56 lanes
+ * reproduce the per-head norm, four lanes per head evaluate the gated values
+ * into threadgroup BF16 bits, and the same values then participate in the
+ * row-wise max reduction and int8 store.  This keeps the epilogue's BF16
+ * rounding boundary while removing the 7,168-wide global BF16 write/read.
+ */
+int h3_gpu_vdn_epilogue_quantize_int8(
+                     h3_gpu *opaque, h3_gpu_tensor *output_int8,
+                     h3_gpu_tensor *output_scales,
+                     const h3_gpu_tensor *readout,
+                     const h3_gpu_tensor *norm_weight,
+                     const h3_gpu_tensor *gate_logits,
+                     uint32_t frames, uint32_t tokens,
+                     uint32_t heads, uint32_t dim, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t rows = (size_t)frames * tokens;
+    size_t count = rows * heads * dim;
+    if (!frames || !tokens || heads != 56 || dim != 128 ||
+        rows > UINT32_MAX || !isfinite(epsilon) || epsilon <= 0.0f ||
+        !h3_gpu_require_bf16(gpu, readout, count,
+                              @"VDN fused epilogue readout") ||
+        !h3_gpu_require_bf16(gpu, norm_weight, dim,
+                              @"VDN fused epilogue norm") ||
+        !h3_gpu_require_bf16(gpu, gate_logits, count,
+                              @"VDN fused epilogue gate") ||
+        !h3_gpu_require_i8(gpu, output_int8, count,
+                           @"VDN fused epilogue int8 output") ||
+        !h3_gpu_require_f32(gpu, output_scales, rows,
+                            @"VDN fused epilogue scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    typedef struct {
+        uint32_t frames, tokens, heads, dim; float epsilon;
+    } args_type;
+    args_type args = {frames, tokens, heads, dim, epsilon};
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_vdn_epilogue_quantize_int8");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+            @"device cannot dispatch fused VDN epilogue quantizer");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(readout).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(gate_logits).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output_int8).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output_scales).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_vdn_add_projected_bf16(

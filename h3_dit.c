@@ -2834,16 +2834,31 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
             dit->gpu, dit->qkv, dit->vdn_gate_down,
             weight->vdn.output_gate_up, weight->vdn.output_gate_up_bias,
             inner_rows, HEAD_DIM, INNER), "VDN output gate up");
-    VDN_OP(h3_gpu_vdn_epilogue_bf16(
-        dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
-        inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
-        "VDN linear epilogue");
+    int fused_output_quantize = weight->vdn.output_int8 &&
+        int8_activation_ready &&
+        getenv("H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8") != NULL;
+    if (fused_output_quantize)
+        VDN_OP(h3_gpu_vdn_epilogue_quantize_int8(
+            dit->gpu, dit->int8_activation, dit->int8_activation_scales,
+            dit->value, weight->vdn.norm, dit->qkv,
+            inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
+            "VDN fused epilogue/output quantize");
+    else
+        VDN_OP(h3_gpu_vdn_epilogue_bf16(
+            dit->gpu, dit->vdn_feature, dit->value, weight->vdn.norm, dit->qkv,
+            inner_frames, frame_rows, HEADS, HEAD_DIM, 1e-6f),
+            "VDN linear epilogue");
     if (weight->vdn.output_int8)
-        VDN_OP(h3_gpu_linear_int8_bf16(
-            dit->gpu, dit->vdn_projected, dit->int8_activation,
-            dit->int8_activation_scales, dit->vdn_feature,
-            weight->vdn.output_int8, weight->vdn.output_scales,
-            inner_rows, INNER, HIDDEN, 0),
+        VDN_OP(fused_output_quantize ?
+            h3_gpu_linear_int8_prequantized_bf16(
+                dit->gpu, dit->vdn_projected, dit->int8_activation,
+                dit->int8_activation_scales, weight->vdn.output_int8,
+                weight->vdn.output_scales, inner_rows, INNER, HIDDEN, 0) :
+            h3_gpu_linear_int8_bf16(
+                dit->gpu, dit->vdn_projected, dit->int8_activation,
+                dit->int8_activation_scales, dit->vdn_feature,
+                weight->vdn.output_int8, weight->vdn.output_scales,
+                inner_rows, INNER, HIDDEN, 0),
             "VDN int8 linear output projection");
     else if (getenv("H3_DISABLE_VDN_SPLIT_NAX"))
         VDN_OP(h3_gpu_linear_bf16(

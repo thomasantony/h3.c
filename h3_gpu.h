@@ -946,6 +946,17 @@ int h3_gpu_vdn_epilogue_bf16(
                      const h3_gpu_tensor *gate_logits,
                      uint32_t frames, uint32_t tokens_per_frame,
                      uint32_t heads, uint32_t head_dim, float epsilon);
+/* Fused VDN epilogue and dynamic row quantization.  The opt-in path writes
+ * the row-major int8 activation/scales consumed by the VDN output projection
+ * directly, avoiding a full-width BF16 staging buffer and reread. */
+int h3_gpu_vdn_epilogue_quantize_int8(
+                     h3_gpu *gpu, h3_gpu_tensor *output_int8,
+                     h3_gpu_tensor *output_scales,
+                     const h3_gpu_tensor *readout_head_major,
+                     const h3_gpu_tensor *norm_weight,
+                     const h3_gpu_tensor *gate_logits,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t heads, uint32_t head_dim, float epsilon);
 int h3_gpu_vdn_add_projected_bf16(
                      h3_gpu *gpu, h3_gpu_tensor *destination,
                      uint32_t destination_row,

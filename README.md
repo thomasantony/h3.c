@@ -179,6 +179,10 @@ reuses the solve RHS arena, reducing bandwidth and matrix-product cost.  The
 solve-pack pass emits those compact transition/injection banks directly, so
 the scan does not perform a second full-bank conversion; the default scan
 remains FP32 for numerical closeness.
+`H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1` additionally fuses the VDN epilogue with
+the row-wise int8 conversion used by the output projection, avoiding a full
+7,168-wide BF16 staging write/read.  It is restricted to the fixed H3 VDN
+shape and remains opt-in until its device-specific timing is measured.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 
