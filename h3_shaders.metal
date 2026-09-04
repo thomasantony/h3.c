@@ -2869,6 +2869,32 @@ inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
 }
 
 #ifdef H3_METAL_HAS_TENSOR
+/* VDN alpha projections use F32 activations and BF16 checkpoint weights. The
+ * Metal 4 TensorOps matmul supports this mixed-precision pair directly and
+ * accumulates into the F32 destination, avoiding the serial GEMV path. */
+kernel void h3_vdn_linear_f32_bf16_nax_r128(
+                           device float *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device float *output [[buffer(2)]],
+                           constant vdn_linear_args &args [[buffer(3)]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device float, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim, (int)args.output_dim));
+    auto y = tensor<device float, dextents<int32_t, 2>, tensor_inline>(
+        output,
+        dextents<int32_t, 2>((int)args.output_dim, (int)args.rows));
+    auto mx = x.slice(0, (int)group.x * 128);
+    auto mw = w.slice((int)group.y * 64, 0);
+    auto my = y.slice((int)group.y * 64, (int)group.x * 128);
+    matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
+                                 false, true, false),
+             execution_simdgroups<4>> mm;
+    mm.run(mx, mw, my);
+}
+
 /* Draw Things' Metal 4 matmul schedules neighboring row/column tiles in
  * Morton order. The decoder is adapted from ccv's BSD-3-Clause NAMatMul;
  * see THIRD_PARTY_NOTICES.md. Keep it local so the ordinary Metal path stays
