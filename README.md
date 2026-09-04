@@ -161,7 +161,7 @@ H3_VDN_TENSOR_READOUT=1 H3_VDN_FP16_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_FUSED_OUTPUT_QUANTIZE_INT8=1 \
 H3_VDN_FUSED_OUTPUT_ADD=1 H3_VDN_STATS_GATE_CACHE=1 \
 H3_VDN_STATS_GATE_REUSE=1 H3_INT8_LINEAR_KNOWN_LONG=1 \
-H3_VDN_DECAY_CHUNKED=1 H3_VDN_MPS_CHOLESKY=1 \
+H3_VDN_DECAY_CHUNKED=1 H3_VDN_LINEAR_KNOWN=1 H3_VDN_MPS_CHOLESKY=1 \
 H3_MPSGRAPH_EXECUTABLE=1 \
 ./h3_dit_bench_full MiniMax-H3
 ```
@@ -201,6 +201,9 @@ small extra FP16 rounding step for throughput.
 `H3_VDN_DECAY_CHUNKED=1` computes each five-frame bridge's log factors once
 per head/channel vector and emits the chunk's before/after factors together;
 the original per-frame log/exp kernel remains the fallback.
+`H3_VDN_LINEAR_KNOWN=1` selects compile-time K-loop instances for the VDN
+5,376→56, 5,376→128, and 128→7,168 int8 projections; dynamic-shape kernels
+remain available for A/B comparison.
 `H3_INT8_LINEAR_KNOWN_LONG=1` extends the compile-time 7,168→5,376 int8
 projection kernel to long VDN row counts; it is opt-in because the generic
 dynamic-shape kernel can win on some devices.

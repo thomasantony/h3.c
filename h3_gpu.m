@@ -566,12 +566,15 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128x64_output56"];
+            [names addObject:@"h3_linear_int8_nax_r128x64_output56_k5376"];
             [names addObject:
                 @"h3_linear_int8_nax_r128_full_k14336"];
             [names addObject:
                 @"h3_linear_int8_nax_r128x256_full_k14336"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r128_k5376_o128"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r128_k128_o7168"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_add"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
@@ -5554,8 +5557,12 @@ int h3_gpu_linear_int8_56_bf16_offset(
         (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
             input_dim, 1.0f, @"VDN int8 gate input"))) return 0;
+    NSString *pipeline_name = input_dim == 5376 &&
+        getenv("H3_VDN_LINEAR_KNOWN") ?
+        @"h3_linear_int8_nax_r128x64_output56_k5376" :
+        @"h3_linear_int8_nax_r128x64_output56";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_linear_int8_nax_r128x64_output56");
+        gpu, pipeline_name);
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
     linear_args args = {rows, input_dim, 56, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : output;
@@ -5668,9 +5675,15 @@ static int h3_gpu_linear_int8_bf16_layout(
         (add_residual || rows <= 2048 ||
          getenv("H3_INT8_LINEAR_KNOWN_LONG")) &&
         getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
+    BOOL known_vdn_down = local_scales && input_dim == 5376 &&
+        output_dim == 128 && getenv("H3_VDN_LINEAR_KNOWN");
+    BOOL known_vdn_up = local_scales && input_dim == 128 &&
+        output_dim == 7168 && getenv("H3_VDN_LINEAR_KNOWN");
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, add_residual ? @"h3_linear_int8_local_scales_nax_r128_add" :
              known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+             known_vdn_down ? @"h3_linear_int8_local_scales_nax_r128_k5376_o128" :
+             known_vdn_up ? @"h3_linear_int8_local_scales_nax_r128_k128_o7168" :
              local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
                             @"h3_linear_int8_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {

@@ -5073,8 +5073,11 @@ kernel void h3_linear_int8_nax_r128(
 }
 
 /* VDN gate projections have 56 output channels. Pad the checkpoint rows to
- * the 64-column TensorOps granularity, but write a compact 56-wide result. */
-kernel void h3_linear_int8_nax_r128x64_output56(
+ * the 64-column TensorOps granularity, but write a compact 56-wide result.
+ * The optional fixed-K instance removes the dynamic loop bound shared by the
+ * beta and softmax-gate projections. */
+template<uint INPUT_DIM>
+kernel void h3_linear_int8_nax_r128x64_output56_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -5088,11 +5091,12 @@ kernel void h3_linear_int8_nax_r128x64_output56(
     constexpr uint OUTPUT_DIM = 56;
     uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
     uint row_start = row_tile * ROW_TILE;
+    uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        input, dextents<int32_t, 2>((int)args.input_dim,
+        input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
     auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        weight, dextents<int32_t, 2>((int)args.input_dim,
+        weight, dextents<int32_t, 2>((int)input_dim,
                                      (int)COLUMN_TILE));
     constexpr auto descriptor = matmul2d_descriptor(
         ROW_TILE, COLUMN_TILE, 128, false, true, true,
@@ -5105,7 +5109,7 @@ kernel void h3_linear_int8_nax_r128x64_output56(
     #pragma clang loop unroll(full)
     for (ushort element = 0; element < accum.get_capacity(); element++)
         if (accum.is_valid_element(element)) accum[element] = 0;
-    for (uint k = 0; k < args.input_dim; k += 128) {
+    for (uint k = 0; k < input_dim; k += 128) {
         auto a = x.slice<ROW_TILE, 128>((int)k, (int)row_start);
         auto b = w.slice<128, COLUMN_TILE>((int)k, 0);
         mm.run(a, b, accum);
@@ -5124,6 +5128,14 @@ kernel void h3_linear_int8_nax_r128x64_output56(
         }
     }
 }
+typedef decltype(h3_linear_int8_nax_r128x64_output56_impl<0>)
+    h3_linear_int8_nax_r128x64_output56_t;
+template [[host_name("h3_linear_int8_nax_r128x64_output56")]]
+kernel h3_linear_int8_nax_r128x64_output56_t
+    h3_linear_int8_nax_r128x64_output56_impl<0>;
+template [[host_name("h3_linear_int8_nax_r128x64_output56_k5376")]]
+kernel h3_linear_int8_nax_r128x64_output56_t
+    h3_linear_int8_nax_r128x64_output56_impl<5376>;
 
 /* One-scale FC2 path. A static full-K product lets NAX own the
  * complete 14336-wide reduction; scale loads overlap that long operation. */
@@ -5324,6 +5336,12 @@ kernel h3_linear_int8_local_scales_nax_r128_t
 template [[host_name("h3_linear_int8_local_scales_nax_r128_k7168")]]
 kernel h3_linear_int8_local_scales_nax_r128_t
     h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, false>;
+template [[host_name("h3_linear_int8_local_scales_nax_r128_k5376_o128")]]
+kernel h3_linear_int8_local_scales_nax_r128_t
+    h3_linear_int8_local_scales_nax_r128_impl<5376, 128, false>;
+template [[host_name("h3_linear_int8_local_scales_nax_r128_k128_o7168")]]
+kernel h3_linear_int8_local_scales_nax_r128_t
+    h3_linear_int8_local_scales_nax_r128_impl<128, 7168, false>;
 typedef decltype(h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, true>)
     h3_linear_int8_local_scales_nax_r128_add_t;
 template [[host_name("h3_linear_int8_local_scales_nax_r128_add")]]
