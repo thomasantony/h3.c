@@ -157,7 +157,7 @@ H3_VDN_HEAD_MAJOR_QKV=1 H3_VDN_DIRECT_VIDEO_HIDDEN=1 \
 H3_VDN_INT8_FRAME_MEAN=1 H3_VDN_FUSED_ALPHA_UP=1 \
 H3_VDN_FUSED_KV_CONV=1 H3_VDN_FUSED_QUERY_FEATURE=1 \
 H3_VDN_PRECOMPUTE_DECAY=1 H3_VDN_TENSOR_LINEAR=1 \
-H3_VDN_TENSOR_READOUT=1 \
+H3_VDN_TENSOR_READOUT=1 H3_VDN_FP16_SCAN=1 \
 H3_VDN_FUSED_GATE_QUANTIZE_INT8=1 H3_VDN_MPS_CHOLESKY=1 \
 H3_MPSGRAPH_EXECUTABLE=1 \
 ./h3_dit_bench_full MiniMax-H3
@@ -174,6 +174,9 @@ Metal 4 TensorOps; the existing vectorized GEMV remains the fallback.
 `H3_VDN_TENSOR_READOUT` routes the per-frame/head VDN state readout through a
 direct Metal 4 TensorOps tile, avoiding the MPSGraph transpose/feed wrapper;
 the graph readout remains the fallback when the flag is unset.
+`H3_VDN_FP16_SCAN` stores the bidirectional 128x128 state scan in FP16 and
+reuses the solve RHS arena, reducing bandwidth and matrix-product cost; the
+default scan remains FP32 for numerical closeness.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 

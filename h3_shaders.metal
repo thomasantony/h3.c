@@ -76,6 +76,53 @@ kernel void h3_copy_fp16_bf16_vec4(
             h3_f32x4_to_bf16(float4(source[args.source_offset + index]));
 }
 
+/* Convert the two F32 banks produced by the VDN solve into one compact FP16
+ * scan workspace.  The transition bank occupies [0, bank) and the injection
+ * bank follows it; keeping both in a separate workspace makes this conversion
+ * safe even when the source solution buffer is reused by the solver. */
+struct vdn_scan_pack_args { uint bank_elements; };
+kernel void h3_vdn_pack_scan_fp16(
+                                device const float *solution [[buffer(0)]],
+                                device const float *injection [[buffer(1)]],
+                                device half *workspace [[buffer(2)]],
+                                constant vdn_scan_pack_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index >= args.bank_elements * 2u) return;
+    workspace[index] = half(index < args.bank_elements ?
+                             solution[index] :
+                             injection[index - args.bank_elements]);
+}
+
+kernel void h3_vdn_pack_scan_fp16_vec4(
+                                device const float4 *solution [[buffer(0)]],
+                                device const float4 *injection [[buffer(1)]],
+                                device half4 *workspace [[buffer(2)]],
+                                constant vdn_scan_pack_args &args [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint vectors = args.bank_elements / 4u;
+    if (index >= vectors * 2u) return;
+    workspace[index] = half4(index < vectors ? solution[index] :
+                              injection[index - vectors]);
+}
+
+/* The FP16 MPS scan needs the prompt state in the same storage format as its
+ * transition matrices.  This small pass writes it into the unused tail of a
+ * F32 prefix bank; the gather stage continues to use the original F32 state,
+ * so no extra persistent tensor is required. */
+kernel void h3_vdn_pack_state_fp16(
+                                device const float *source [[buffer(0)]],
+                                device half *destination [[buffer(1)]],
+                                uint index [[thread_position_in_grid]]) {
+    destination[index] = half(source[index]);
+}
+
+kernel void h3_vdn_pack_state_fp16_vec4(
+                                device const float4 *source [[buffer(0)]],
+                                device half4 *destination [[buffer(1)]],
+                                uint index [[thread_position_in_grid]]) {
+    destination[index] = half4(source[index]);
+}
+
 struct h3_attention_pack_args {
     uint source_row; uint destination_batch; uint destination_row;
     uint sequence; uint rows; uint heads; uint dim;
@@ -1928,6 +1975,109 @@ kernel void h3_vdn_gather_state_bf16(
     state[index] = h3_f32_to_bf16(before * before_decay + after * after_decay);
 }
 
+/* FP16 scan counterpart. PREFIX and SUFFIX are F32 tensors at the API level,
+ * but their first half of each allocation is occupied by compact FP16 scan
+ * matrices. The prompt state remains F32 and is converted only at the two
+ * edge reads, preserving the existing bridge-selection logic. */
+kernel void h3_vdn_gather_state_fp16(
+                                device const half *prefix [[buffer(0)]],
+                                device const half *suffix [[buffer(1)]],
+                                device const float *alpha [[buffer(2)]],
+                                device const float *text [[buffer(3)]],
+                                device ushort *state [[buffer(4)]],
+                                constant vdn_gather_args &args [[buffer(5)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint count = args.frames * args.heads * matrix_size;
+    if (index >= count) return;
+    uint matrix_element = index % matrix_size;
+    uint matrix_index = index / matrix_size;
+    uint frame = matrix_index / args.heads;
+    uint head = matrix_index - frame * args.heads;
+    uint key_channel = matrix_element % args.dim;
+    uint original_frame = frame + 1;
+    int chunk = int(original_frame / 5);
+    int lo = (chunk - 1) * 5 - 1;
+    int hi = (chunk + 2) * 5 - 2;
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < int(args.frames);
+    uint before_frame = uint(clamp(last_before, 0, int(args.frames) - 1));
+    uint after_frame = uint(clamp(first_after, 0, int(args.frames) - 1));
+    uint local = head * matrix_size + matrix_element;
+    float before = has_before ?
+        float(prefix[before_frame * args.heads * matrix_size + local]) :
+        text[local];
+    float after = has_after ?
+        float(suffix[after_frame * args.heads * matrix_size + local]) :
+        text[local];
+    int bridge_before = max(last_before + 1, 0);
+    int bridge_after = min(first_after, int(args.frames));
+    float before_log = 0.0f;
+    for (int f = bridge_before; f <= int(frame); f++)
+        before_log += log(max(alpha[(uint(f) * args.heads + head) * args.dim +
+                                   key_channel], 1.0e-12f));
+    float after_log = 0.0f;
+    for (int f = int(frame); f < bridge_after; f++)
+        after_log += log(max(alpha[(uint(f) * args.heads + head) * args.dim +
+                                  key_channel], 1.0e-12f));
+    state[index] = h3_f32_to_bf16(
+        before * exp(before_log) + after * exp(after_log));
+}
+
+kernel void h3_vdn_gather_state_fp16_vec4(
+                                device const half4 *prefix [[buffer(0)]],
+                                device const half4 *suffix [[buffer(1)]],
+                                device const float4 *alpha [[buffer(2)]],
+                                device const float4 *text [[buffer(3)]],
+                                device ushort4 *state [[buffer(4)]],
+                                constant vdn_gather_args &args [[buffer(5)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint vectors_per_matrix = matrix_size / 4u;
+    uint count = args.frames * args.heads * vectors_per_matrix;
+    if (index >= count) return;
+    uint vector = index % vectors_per_matrix;
+    uint matrix_index = index / vectors_per_matrix;
+    uint frame = matrix_index / args.heads;
+    uint head = matrix_index - frame * args.heads;
+    uint matrix_element = vector * 4u;
+    int original_frame = int(frame) + 1;
+    int chunk = original_frame / 5;
+    int lo = (chunk - 1) * 5 - 1;
+    int hi = (chunk + 2) * 5 - 2;
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < int(args.frames);
+    uint before_frame = uint(clamp(last_before, 0, int(args.frames) - 1));
+    uint after_frame = uint(clamp(first_after, 0, int(args.frames) - 1));
+    uint local = head * matrix_size + matrix_element;
+    float4 before = has_before ?
+        float4(prefix[(before_frame * args.heads * matrix_size + local) / 4u]) :
+        text[local / 4u];
+    float4 after = has_after ?
+        float4(suffix[(after_frame * args.heads * matrix_size + local) / 4u]) :
+        text[local / 4u];
+    uint alpha_vectors = args.dim / 4u;
+    int bridge_before = max(last_before + 1, 0);
+    int bridge_after = min(first_after, int(args.frames));
+    float4 before_log = 0.0f;
+    for (int f = bridge_before; f <= int(frame); f++)
+        before_log += log(max(alpha[(uint(f) * args.heads + head) *
+                                    alpha_vectors + vector],
+                              float4(1.0e-12f)));
+    float4 after_log = 0.0f;
+    for (int f = int(frame); f < bridge_after; f++)
+        after_log += log(max(alpha[(uint(f) * args.heads + head) *
+                                   alpha_vectors + vector],
+                             float4(1.0e-12f)));
+    uint output_index = matrix_index * vectors_per_matrix + vector;
+    state[output_index] = h3_f32x4_to_bf16(
+        before * exp(before_log) + after * exp(after_log));
+}
+
 kernel void h3_vdn_gather_state_bf16_decay(
                                 device const float *prefix [[buffer(0)]],
                                 device const float *suffix [[buffer(1)]],
@@ -1964,6 +2114,91 @@ kernel void h3_vdn_gather_state_bf16_decay(
     uint decay_index = (frame * args.heads + head) * args.dim + key_channel;
     state[index] = h3_f32_to_bf16(
         before * before_decay[decay_index] + after * after_decay[decay_index]);
+}
+
+kernel void h3_vdn_gather_state_fp16_decay(
+                                device const half *prefix [[buffer(0)]],
+                                device const half *suffix [[buffer(1)]],
+                                device const float *alpha [[buffer(2)]],
+                                device const float *text [[buffer(3)]],
+                                device const float *before_decay [[buffer(4)]],
+                                device const float *after_decay [[buffer(5)]],
+                                device ushort *state [[buffer(6)]],
+                                constant vdn_gather_args &args [[buffer(7)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint count = args.frames * args.heads * matrix_size;
+    if (index >= count) return;
+    uint matrix_element = index % matrix_size;
+    uint matrix_index = index / matrix_size;
+    uint frame = matrix_index / args.heads;
+    uint head = matrix_index - frame * args.heads;
+    uint key_channel = matrix_element % args.dim;
+    int original_frame = int(frame) + 1;
+    int chunk = original_frame / 5;
+    int lo = (chunk - 1) * 5 - 1;
+    int hi = (chunk + 2) * 5 - 2;
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < int(args.frames);
+    uint before_frame = uint(clamp(last_before, 0, int(args.frames) - 1));
+    uint after_frame = uint(clamp(first_after, 0, int(args.frames) - 1));
+    uint local = head * matrix_size + matrix_element;
+    float before = has_before ?
+        float(prefix[before_frame * args.heads * matrix_size + local]) :
+        text[local];
+    float after = has_after ?
+        float(suffix[after_frame * args.heads * matrix_size + local]) :
+        text[local];
+    uint decay_index = (frame * args.heads + head) * args.dim + key_channel;
+    state[index] = h3_f32_to_bf16(
+        before * before_decay[decay_index] + after * after_decay[decay_index]);
+}
+
+kernel void h3_vdn_gather_state_fp16_decay_vec4(
+                                device const half4 *prefix [[buffer(0)]],
+                                device const half4 *suffix [[buffer(1)]],
+                                device const float *alpha [[buffer(2)]],
+                                device const float4 *text [[buffer(3)]],
+                                device const float4 *before_decay [[buffer(4)]],
+                                device const float4 *after_decay [[buffer(5)]],
+                                device ushort4 *state [[buffer(6)]],
+                                constant vdn_gather_args &args [[buffer(7)]],
+                                uint index [[thread_position_in_grid]]) {
+    uint matrix_size = args.dim * args.dim;
+    uint vectors_per_matrix = matrix_size / 4u;
+    uint count = args.frames * args.heads * vectors_per_matrix;
+    if (index >= count) return;
+    uint vector = index % vectors_per_matrix;
+    uint matrix_index = index / vectors_per_matrix;
+    uint frame = matrix_index / args.heads;
+    uint head = matrix_index - frame * args.heads;
+    uint matrix_element = vector * 4u;
+    uint key_channel = matrix_element % args.dim;
+    int original_frame = int(frame) + 1;
+    int chunk = original_frame / 5;
+    int lo = (chunk - 1) * 5 - 1;
+    int hi = (chunk + 2) * 5 - 2;
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < int(args.frames);
+    uint before_frame = uint(clamp(last_before, 0, int(args.frames) - 1));
+    uint after_frame = uint(clamp(first_after, 0, int(args.frames) - 1));
+    uint local = head * matrix_size + matrix_element;
+    float4 before = has_before ?
+        float4(prefix[(before_frame * args.heads * matrix_size + local) / 4u]) :
+        text[local / 4u];
+    float4 after = has_after ?
+        float4(suffix[(after_frame * args.heads * matrix_size + local) / 4u]) :
+        text[local / 4u];
+    uint decay_index = (frame * args.heads + head) * args.dim + key_channel;
+    float4 before_scale = before_decay[decay_index / 4u];
+    float4 after_scale = after_decay[decay_index / 4u];
+    uint output_index = matrix_index * vectors_per_matrix + vector;
+    state[output_index] = h3_f32x4_to_bf16(
+        before * before_scale + after * after_scale);
 }
 
 kernel void h3_vdn_gather_state_bf16_decay_vec4(

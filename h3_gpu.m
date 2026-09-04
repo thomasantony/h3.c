@@ -482,10 +482,15 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_prepare_solve_f32",
             @"h3_vdn_cholesky_solve_f32",
             @"h3_vdn_pack_solve_f32",
+            @"h3_vdn_pack_scan_fp16", @"h3_vdn_pack_scan_fp16_vec4",
+            @"h3_vdn_pack_state_fp16", @"h3_vdn_pack_state_fp16_vec4",
             @"h3_vdn_scale_f32", @"h3_vdn_decay_f32",
             @"h3_vdn_decay_vec4_f32",
             @"h3_vdn_gather_state_bf16",
+            @"h3_vdn_gather_state_fp16", @"h3_vdn_gather_state_fp16_vec4",
             @"h3_vdn_gather_state_bf16_decay",
+            @"h3_vdn_gather_state_fp16_decay",
+            @"h3_vdn_gather_state_fp16_decay_vec4",
             @"h3_vdn_gather_state_bf16_decay_vec4",
             @"h3_vdn_epilogue_bf16", @"h3_vdn_epilogue_vec4_bf16",
             @"h3_vdn_add_projected_bf16",
@@ -3428,6 +3433,137 @@ int h3_gpu_vdn_scan_f32(
     return 1;
 }
 
+int h3_gpu_vdn_scan_fp16(
+                     h3_gpu *opaque, h3_gpu_tensor *prefix,
+                     h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *injection,
+                     const h3_gpu_tensor *solution,
+                     h3_gpu_tensor *scratch,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t matrix_elements = (size_t)heads * dim * dim;
+    size_t bank_elements = (size_t)frames * matrix_elements;
+    size_t solution_elements = bank_elements * 2;
+    size_t half_bank_bytes = bank_elements * sizeof(uint16_t);
+    size_t text_elements = matrix_elements;
+    if (!frames || !heads || !dim ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_f32(gpu, prefix, bank_elements,
+                            @"VDN FP16 prefix bank") ||
+        !h3_gpu_require_f32(gpu, suffix, bank_elements,
+                            @"VDN FP16 suffix bank") ||
+        !h3_gpu_require_f32(gpu, injection, bank_elements,
+                            @"VDN FP16 injection bank") ||
+        !h3_gpu_require_f32(gpu, solution, solution_elements,
+                            @"VDN FP16 transition solutions") ||
+        !h3_gpu_require_f32(gpu, scratch, solution_elements,
+                            @"VDN FP16 scan workspace") ||
+        !h3_gpu_require_f32(gpu, text_state, text_elements,
+                            @"VDN FP16 text state") ||
+        half_bank_bytes > TENSOR(prefix).bytes ||
+        half_bank_bytes > TENSOR(suffix).bytes ||
+        bank_elements > UINT32_MAX || solution_elements > UINT32_MAX ||
+        half_bank_bytes > NSUIntegerMax - sizeof(uint16_t) * text_elements)
+        return 0;
+    typedef struct { uint32_t bank_elements; } pack_args_type;
+    pack_args_type pack_args = {(uint32_t)bank_elements};
+    int pack_vec4 = solution_elements % 4 == 0;
+    NSString *pack_name = pack_vec4 ? @"h3_vdn_pack_scan_fp16_vec4" :
+                                       @"h3_vdn_pack_scan_fp16";
+    uint32_t pack_count = (uint32_t)(pack_vec4 ? solution_elements / 4 :
+                                      solution_elements);
+    if (!h3_gpu_dispatch_1d(gpu, pack_name, pack_count,
+                            ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:TENSOR(solution).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scratch).buffer offset:0 atIndex:2];
+        [encoder setBytes:&pack_args length:sizeof(pack_args) atIndex:3];
+    })) return 0;
+
+    /* The unused tail of PREFIX holds a half-precision copy of TEXT_STATE so
+     * the initial MPS product has the same element type as the scan banks. */
+    size_t text_offset = half_bank_bytes;
+    int state_vec4 = text_elements % 4 == 0;
+    NSString *state_name = state_vec4 ? @"h3_vdn_pack_state_fp16_vec4" :
+                                         @"h3_vdn_pack_state_fp16";
+    uint32_t state_count = (uint32_t)(state_vec4 ? text_elements / 4 :
+                                      text_elements);
+    if (!h3_gpu_dispatch_1d(gpu, state_name, state_count,
+                            ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:TENSOR(text_state).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(prefix).buffer
+                       offset:text_offset atIndex:1];
+    })) return 0;
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> encoder = [gpu.command blitCommandEncoder];
+        [encoder copyFromBuffer:TENSOR(scratch).buffer
+                   sourceOffset:half_bank_bytes
+                       toBuffer:TENSOR(prefix).buffer destinationOffset:0
+                          size:half_bank_bytes];
+        [encoder copyFromBuffer:TENSOR(scratch).buffer
+                   sourceOffset:half_bank_bytes
+                       toBuffer:TENSOR(suffix).buffer destinationOffset:0
+                          size:half_bank_bytes];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.blit_copies += 2;
+    gpu.stats = stats;
+
+    @autoreleasepool {
+        NSUInteger row_bytes = (NSUInteger)dim * sizeof(uint16_t);
+        NSUInteger matrix_bytes = (NSUInteger)dim * row_bytes;
+        MPSMatrixDescriptor *state_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:dim matrices:heads
+            rowBytes:row_bytes matrixBytes:matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *transition_descriptor = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:dim matrices:heads
+            rowBytes:row_bytes matrixBytes:matrix_bytes
+            dataType:MPSDataTypeFloat16];
+        MPSMatrix *text_matrix = [[MPSMatrix alloc]
+            initWithBuffer:TENSOR(prefix).buffer offset:text_offset
+            descriptor:state_descriptor];
+        MPSMatrixMultiplication *multiply = [[MPSMatrixMultiplication alloc]
+            initWithDevice:gpu.device transposeLeft:NO transposeRight:NO
+            resultRows:dim resultColumns:dim interiorColumns:dim
+            alpha:1.0 beta:1.0];
+        multiply.batchSize = heads;
+        for (uint32_t frame = 0; frame < frames; frame++) {
+            NSUInteger matrix_offset = (NSUInteger)frame * heads * matrix_bytes;
+            MPSMatrix *left = frame == 0 ? text_matrix : [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(prefix).buffer
+                offset:(NSUInteger)(frame - 1) * heads * matrix_bytes
+                descriptor:state_descriptor];
+            MPSMatrix *right = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(scratch).buffer
+                offset:matrix_offset descriptor:transition_descriptor];
+            MPSMatrix *result = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(prefix).buffer offset:matrix_offset
+                descriptor:state_descriptor];
+            [multiply encodeToCommandBuffer:gpu.command leftMatrix:left
+                    rightMatrix:right resultMatrix:result];
+        }
+        for (uint32_t reverse = frames; reverse-- > 0;) {
+            NSUInteger matrix_offset = (NSUInteger)reverse * heads * matrix_bytes;
+            MPSMatrix *left = reverse + 1 == frames ? text_matrix :
+                [[MPSMatrix alloc] initWithBuffer:TENSOR(suffix).buffer
+                    offset:(NSUInteger)(reverse + 1) * heads * matrix_bytes
+                    descriptor:state_descriptor];
+            MPSMatrix *right = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(scratch).buffer
+                offset:matrix_offset descriptor:transition_descriptor];
+            MPSMatrix *result = [[MPSMatrix alloc]
+                initWithBuffer:TENSOR(suffix).buffer offset:matrix_offset
+                descriptor:state_descriptor];
+            [multiply encodeToCommandBuffer:gpu.command leftMatrix:left
+                    rightMatrix:right resultMatrix:result];
+        }
+    }
+    return 1;
+}
+
 int h3_gpu_vdn_gather_state_bf16(
                      h3_gpu *opaque, h3_gpu_tensor *state,
                      const h3_gpu_tensor *prefix,
@@ -3449,6 +3585,44 @@ int h3_gpu_vdn_gather_state_bf16(
     args_type args = {frames, heads, dim};
     return h3_gpu_dispatch_1d(gpu, @"h3_vdn_gather_state_bf16",
         (uint32_t)matrices, ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(text_state).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(state).buffer offset:0 atIndex:4];
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        });
+}
+
+int h3_gpu_vdn_gather_state_fp16(
+                     h3_gpu *opaque, h3_gpu_tensor *state,
+                     const h3_gpu_tensor *prefix,
+                     const h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t matrices = (size_t)frames * heads * dim * dim;
+    size_t alpha_elements = (size_t)frames * heads * dim;
+    if (!frames || !heads || !dim || matrices > UINT32_MAX ||
+        !h3_gpu_require_f32(gpu, prefix, matrices,
+                            @"VDN FP16 gather prefix") ||
+        !h3_gpu_require_f32(gpu, suffix, matrices,
+                            @"VDN FP16 gather suffix") ||
+        !h3_gpu_require_f32(gpu, alpha, alpha_elements,
+                            @"VDN FP16 gather alpha") ||
+        !h3_gpu_require_f32(gpu, text_state, (size_t)heads * dim * dim,
+                            @"VDN FP16 gather text") ||
+        !h3_gpu_require_bf16(gpu, state, matrices,
+                             @"VDN FP16 gathered state")) return 0;
+    typedef struct { uint32_t frames, heads, dim; } args_type;
+    args_type args = {frames, heads, dim};
+    int vec4 = dim % 4 == 0;
+    NSString *name = vec4 ? @"h3_vdn_gather_state_fp16_vec4" :
+                            @"h3_vdn_gather_state_fp16";
+    uint32_t dispatch_count = (uint32_t)(vec4 ? matrices / 4 : matrices);
+    return h3_gpu_dispatch_1d(gpu, name, dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
@@ -3490,6 +3664,52 @@ int h3_gpu_vdn_gather_state_bf16_decay(
     return h3_gpu_dispatch_1d(gpu, vec4 ?
         @"h3_vdn_gather_state_bf16_decay_vec4" :
         @"h3_vdn_gather_state_bf16_decay", (uint32_t)dispatch_count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(text_state).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(before_decay).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(after_decay).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(state).buffer offset:0 atIndex:6];
+            [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        });
+}
+
+int h3_gpu_vdn_gather_state_fp16_decay(
+                     h3_gpu *opaque, h3_gpu_tensor *state,
+                     const h3_gpu_tensor *prefix,
+                     const h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *text_state,
+                     const h3_gpu_tensor *before_decay,
+                     const h3_gpu_tensor *after_decay,
+                     uint32_t frames, uint32_t heads, uint32_t dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t matrices = (size_t)frames * heads * dim * dim;
+    size_t alpha_elements = (size_t)frames * heads * dim;
+    if (!frames || !heads || !dim || matrices > UINT32_MAX ||
+        !h3_gpu_require_f32(gpu, prefix, matrices,
+                            @"VDN FP16 gather prefix") ||
+        !h3_gpu_require_f32(gpu, suffix, matrices,
+                            @"VDN FP16 gather suffix") ||
+        !h3_gpu_require_f32(gpu, alpha, alpha_elements,
+                            @"VDN FP16 gather alpha") ||
+        !h3_gpu_require_f32(gpu, text_state, (size_t)heads * dim * dim,
+                            @"VDN FP16 gather text") ||
+        !h3_gpu_require_f32(gpu, before_decay, alpha_elements,
+                            @"VDN FP16 before decay") ||
+        !h3_gpu_require_f32(gpu, after_decay, alpha_elements,
+                            @"VDN FP16 after decay") ||
+        !h3_gpu_require_bf16(gpu, state, matrices,
+                             @"VDN FP16 gathered state")) return 0;
+    typedef struct { uint32_t frames, heads, dim; } args_type;
+    args_type args = {frames, heads, dim};
+    int vec4 = dim % 4 == 0;
+    NSString *name = vec4 ? @"h3_vdn_gather_state_fp16_decay_vec4" :
+                            @"h3_vdn_gather_state_fp16_decay";
+    uint32_t dispatch_count = (uint32_t)(vec4 ? matrices / 4 : matrices);
+    return h3_gpu_dispatch_1d(gpu, name, dispatch_count,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];

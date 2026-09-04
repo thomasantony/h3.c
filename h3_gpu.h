@@ -868,6 +868,18 @@ int h3_gpu_vdn_scan_f32(
                      const h3_gpu_tensor *solution,
                      const h3_gpu_tensor *text_state,
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
+/* Optional compact scan.  The transition/injection sources remain F32, while
+ * PREFIX/SUFFIX and the temporary scan workspace are interpreted as FP16
+ * storage for the MPS matrix products.  The workspace is only needed until
+ * this call completes and can alias the VDN solve RHS arena. */
+int h3_gpu_vdn_scan_fp16(
+                     h3_gpu *gpu, h3_gpu_tensor *prefix,
+                     h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *injection,
+                     const h3_gpu_tensor *solution,
+                     h3_gpu_tensor *scratch,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_gather_state_bf16(
                      h3_gpu *gpu, h3_gpu_tensor *state,
                      const h3_gpu_tensor *prefix,
@@ -875,7 +887,23 @@ int h3_gpu_vdn_gather_state_bf16(
                      const h3_gpu_tensor *alpha,
                      const h3_gpu_tensor *text_state,
                      uint32_t frames, uint32_t heads, uint32_t head_dim);
+int h3_gpu_vdn_gather_state_fp16(
+                     h3_gpu *gpu, h3_gpu_tensor *state,
+                     const h3_gpu_tensor *prefix,
+                     const h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *text_state,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
 int h3_gpu_vdn_gather_state_bf16_decay(
+                     h3_gpu *gpu, h3_gpu_tensor *state,
+                     const h3_gpu_tensor *prefix,
+                     const h3_gpu_tensor *suffix,
+                     const h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *text_state,
+                     const h3_gpu_tensor *before_decay,
+                     const h3_gpu_tensor *after_decay,
+                     uint32_t frames, uint32_t heads, uint32_t head_dim);
+int h3_gpu_vdn_gather_state_fp16_decay(
                      h3_gpu *gpu, h3_gpu_tensor *state,
                      const h3_gpu_tensor *prefix,
                      const h3_gpu_tensor *suffix,

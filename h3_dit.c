@@ -2753,27 +2753,46 @@ static int run_vdn_linear(h3_dit *dit, const h3_dit_block *weight,
         dit->gpu, dit->vdn_a, dit->vdn_b, dit->vdn_rhs,
         dit->vdn_solution, dit->vdn_alpha,
         inner_frames, HEADS, HEAD_DIM), "VDN video solve");
-    VDN_OP(h3_gpu_vdn_scan_f32(
-        dit->gpu, dit->vdn_prefix, dit->vdn_suffix, dit->vdn_b,
-        dit->vdn_solution, dit->vdn_text_state,
-        inner_frames, HEADS, HEAD_DIM), "VDN bidirectional scans");
+    int fp16_scan = getenv("H3_VDN_FP16_SCAN") != NULL;
+    VDN_OP(fp16_scan ?
+        h3_gpu_vdn_scan_fp16(
+            dit->gpu, dit->vdn_prefix, dit->vdn_suffix, dit->vdn_b,
+            dit->vdn_solution, dit->vdn_rhs, dit->vdn_text_state,
+            inner_frames, HEADS, HEAD_DIM) :
+        h3_gpu_vdn_scan_f32(
+            dit->gpu, dit->vdn_prefix, dit->vdn_suffix, dit->vdn_b,
+            dit->vdn_solution, dit->vdn_text_state,
+            inner_frames, HEADS, HEAD_DIM), "VDN bidirectional scans");
     if (getenv("H3_VDN_PRECOMPUTE_DECAY")) {
         VDN_OP(h3_gpu_vdn_decay_f32(
-            dit->gpu, dit->vdn_before_decay, dit->vdn_after_decay,
-            dit->vdn_alpha, inner_frames, HEADS, HEAD_DIM),
-            "VDN bridge decay factors");
-        VDN_OP(h3_gpu_vdn_gather_state_bf16_decay(
-            dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
-            dit->vdn_prefix, dit->vdn_suffix,
-            dit->vdn_alpha, dit->vdn_text_state,
-            dit->vdn_before_decay, dit->vdn_after_decay,
-            inner_frames, HEADS, HEAD_DIM), "VDN complement state");
+                dit->gpu, dit->vdn_before_decay, dit->vdn_after_decay,
+                dit->vdn_alpha, inner_frames, HEADS, HEAD_DIM),
+                "VDN bridge decay factors");
+        VDN_OP(fp16_scan ?
+            h3_gpu_vdn_gather_state_fp16_decay(
+                dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
+                dit->vdn_prefix, dit->vdn_suffix,
+                dit->vdn_alpha, dit->vdn_text_state,
+                dit->vdn_before_decay, dit->vdn_after_decay,
+                inner_frames, HEADS, HEAD_DIM) :
+            h3_gpu_vdn_gather_state_bf16_decay(
+                dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
+                dit->vdn_prefix, dit->vdn_suffix,
+                dit->vdn_alpha, dit->vdn_text_state,
+                dit->vdn_before_decay, dit->vdn_after_decay,
+                inner_frames, HEADS, HEAD_DIM), "VDN complement state");
     } else {
-        VDN_OP(h3_gpu_vdn_gather_state_bf16(
-            dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
-            dit->vdn_prefix, dit->vdn_suffix,
-            dit->vdn_alpha, dit->vdn_text_state,
-            inner_frames, HEADS, HEAD_DIM), "VDN complement state");
+        VDN_OP(fp16_scan ?
+            h3_gpu_vdn_gather_state_fp16(
+                dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
+                dit->vdn_prefix, dit->vdn_suffix,
+                dit->vdn_alpha, dit->vdn_text_state,
+                inner_frames, HEADS, HEAD_DIM) :
+            h3_gpu_vdn_gather_state_bf16(
+                dit->gpu, dit->vdn_state ? dit->vdn_state : dit->key,
+                dit->vdn_prefix, dit->vdn_suffix,
+                dit->vdn_alpha, dit->vdn_text_state,
+                inner_frames, HEADS, HEAD_DIM), "VDN complement state");
     }
     VDN_OP(h3_gpu_vdn_readout_bf16(
         dit->gpu, dit->value, dit->query,
