@@ -2018,6 +2018,39 @@ kernel void h3_vdn_gather_state_bf16_decay_vec4(
 struct vdn_epilogue_args {
     uint frames; uint tokens; uint heads; uint dim; float epsilon;
 };
+
+/* The readout graph stores query features as [frame, head, token, dim] and
+ * state matrices as [frame, head, dim, dim].  This tiled TensorOps variant
+ * consumes those two contiguous layouts directly, so the VDN readout does not
+ * need an MPSGraph feed/result wrapper or an intermediate transpose. */
+#ifdef H3_METAL_HAS_TENSOR
+struct vdn_readout_args { uint batches; uint tokens; uint dim; };
+kernel void h3_vdn_readout_bf16_nax_r128(
+                                device bfloat *query [[buffer(0)]],
+                                device bfloat *state [[buffer(1)]],
+                                device bfloat *output [[buffer(2)]],
+                                constant vdn_readout_args &args [[buffer(3)]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        query, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.tokens)));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        state, dextents<int32_t, 2>((int)args.dim,
+                                    (int)(args.batches * args.dim)));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        output, dextents<int32_t, 2>((int)args.dim,
+                                     (int)(args.batches * args.tokens)));
+    uint query_row = group.z * args.tokens + group.x * 128;
+    auto mx = x.slice(0, (int)query_row);
+    auto mw = w.slice(0, (int)(group.z * args.dim));
+    auto my = y.slice((int)group.y * 64, (int)query_row);
+    matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
+                                 false, true, false),
+             execution_simdgroups<4>> mm;
+    mm.run(mx, mw, my);
+}
+#endif
+
 kernel void h3_vdn_epilogue_bf16(
                                 device const ushort *readout [[buffer(0)]],
                                 device const ushort *weight [[buffer(1)]],
