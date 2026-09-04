@@ -5733,7 +5733,9 @@ static int h3_gpu_linear_int8_bf16_layout(
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
         uint32_t row_tile = row256 ? 256u : 128u;
-        NSUInteger groups = (NSUInteger)(padded_rows / row_tile) *
+        uint32_t dispatch_padded_rows = row256 ?
+            (rows + 255u) & ~255u : padded_rows;
+        NSUInteger groups = (NSUInteger)(dispatch_padded_rows / row_tile) *
                             (output_dim / 128u);
         [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
