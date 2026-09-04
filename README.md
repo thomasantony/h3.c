@@ -183,6 +183,9 @@ remains FP32 for numerical closeness.
 the row-wise int8 conversion used by the output projection, avoiding a full
 7,168-wide BF16 staging write/read.  It is restricted to the fixed H3 VDN
 shape and remains opt-in until its device-specific timing is measured.
+`H3_VDN_STATS_GATE_CACHE=1` caches each FP16 statistics sigmoid once per
+head/token SIMD group instead of recomputing it for every 4-value vector; the
+general pack kernel remains the fallback for other dimensions.
 `H3_VDN_MPS_CHOLESKY` selects the experimental MPS batched solve; compare hashes
 and timing against the balanced preset before using it for production output.
 

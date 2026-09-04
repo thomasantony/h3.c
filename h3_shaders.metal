@@ -1508,6 +1508,60 @@ kernel void h3_vdn_pack_stats_fp16(
     }
 }
 
+/* The gate is constant across all 32 FP16 vectors belonging to one
+ * head/token pair.  With a 256-thread dispatch, each SIMD group covers one
+ * such pair; cache its sigmoid once instead of evaluating exp() per vector.
+ * The active-shape selector in h3_gpu_vdn_statistics_fp16 restricts this
+ * kernel to the H3 dim=128 layout, while the original kernel remains the
+ * general fallback. */
+kernel void h3_vdn_pack_stats_fp16_gate_cached(
+                                device const ushort4 *key [[buffer(0)]],
+                                device const ushort4 *value [[buffer(1)]],
+                                device const ushort *beta [[buffer(2)]],
+                                device half4 *packed_key [[buffer(3)]],
+                                device half4 *packed_scaled [[buffer(4)]],
+                                constant vdn_stats_pack_args &args [[buffer(5)]],
+                                ushort simdgroup
+                                    [[simdgroup_index_in_threadgroup]],
+                                ushort lane [[thread_index_in_simdgroup]],
+                                uint index [[thread_position_in_grid]]) {
+    constexpr uint VECTORS_PER_HEAD = 32;
+    uint vectors_per_head = args.dim / 4;
+    uint vectors_per_token = args.heads * vectors_per_head;
+    uint count = args.frames * args.tokens * vectors_per_token;
+    bool active = index < count;
+    threadgroup float gates[8];
+    if (active && lane == 0) {
+        uint outer = index / VECTORS_PER_HEAD;
+        uint head = outer % args.heads;
+        uint token_frame = outer / args.heads;
+        uint token = token_frame % args.tokens;
+        uint frame = token_frame / args.tokens;
+        float logit = h3_bf16_to_f32(
+            beta[(frame * args.tokens + token) * args.heads + head]);
+        gates[simdgroup] = 1.0f / (1.0f + exp(-logit));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    uint vector = index % vectors_per_head;
+    uint outer = index / vectors_per_head;
+    uint head = outer % args.heads;
+    uint token_frame = outer / args.heads;
+    uint token = token_frame % args.tokens;
+    uint frame = token_frame / args.tokens;
+    uint destination = ((frame * args.heads + head) * args.tokens + token) *
+                       vectors_per_head + vector;
+    float gate = gates[simdgroup];
+    if (!args.value_pass) {
+        float4 elements = h3_bf16x4_to_f32(key[index]);
+        packed_key[destination] = half4(elements);
+        packed_scaled[destination] = half4(elements * gate);
+    } else {
+        float4 elements = h3_bf16x4_to_f32(value[index]);
+        packed_scaled[destination] = half4(elements * gate);
+    }
+}
+
 struct vdn_stats_cast_args { uint batches; uint dim; uint symmetric; };
 kernel void h3_vdn_cast_stats_fp16_f32(
                                 device const half *input [[buffer(0)]],

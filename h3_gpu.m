@@ -470,7 +470,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vdn_temporal_feature_pair_vec4_bf16",
             @"h3_vdn_temporal_feature_pair_query_bf16",
             @"h3_vdn_temporal_feature_pair_query_vec4_bf16",
-            @"h3_vdn_pack_stats_fp16", @"h3_vdn_cast_stats_fp16_f32",
+            @"h3_vdn_pack_stats_fp16",
+            @"h3_vdn_pack_stats_fp16_gate_cached",
+            @"h3_vdn_cast_stats_fp16_f32",
             @"h3_vdn_frame_mean_f32",
             @"h3_vdn_frame_mean_vec4_f32",
             @"h3_vdn_frame_mean_int8_vec4_f32",
@@ -3058,7 +3060,13 @@ int h3_gpu_vdn_statistics_fp16(
         uint32_t frames, tokens, heads, dim, value_pass;
     } pack_args_type;
     pack_args_type pack_args = {frames, tokens, heads, dim, 0};
-    if (!h3_gpu_dispatch_1d(gpu, @"h3_vdn_pack_stats_fp16",
+    id<MTLComputePipelineState> cached_pack = gpu.pipelines[
+        @"h3_vdn_pack_stats_fp16_gate_cached"];
+    BOOL gate_cached = dim == 128 && getenv("H3_VDN_STATS_GATE_CACHE") &&
+        cached_pack && cached_pack.maxTotalThreadsPerThreadgroup >= 256;
+    NSString *pack_name = gate_cached ?
+        @"h3_vdn_pack_stats_fp16_gate_cached" : @"h3_vdn_pack_stats_fp16";
+    if (!h3_gpu_dispatch_1d(gpu, pack_name,
             (uint32_t)(features / 4),
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
@@ -3108,7 +3116,7 @@ int h3_gpu_vdn_statistics_fp16(
                 [encoder setBytes:&cast_args length:sizeof(cast_args) atIndex:2];
             })) return 0;
     pack_args.value_pass = 1;
-    if (!h3_gpu_dispatch_1d(gpu, @"h3_vdn_pack_stats_fp16",
+    if (!h3_gpu_dispatch_1d(gpu, pack_name,
             (uint32_t)(features / 4),
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
