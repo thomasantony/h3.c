@@ -28,7 +28,8 @@ enum {
     ROPE_HALF = 48,
     SLOTS = 6,
     FINAL_SLOTS = 2,
-    VDN_WINDOW_BATCH_CAP = 4,
+    VDN_WINDOW_BATCH_DEFAULT = 4,
+    VDN_WINDOW_BATCH_CAP = 8,
     VDN_INT8_ATTENTION_OUT_MAX_ROWS = 8192
 };
 
@@ -253,6 +254,16 @@ static unsigned command_block_interval(const h3_dit *dit) {
     if (h3_gpu_is_m5(dit->gpu))
         return dit->active_block_count * 3 / 5;
     return dit->active_block_count == H3_DIT_BLOCKS ? 30u : 0u;
+}
+
+static unsigned vdn_window_batch_limit(void) {
+    const char *value = getenv("H3_VDN_WINDOW_BATCH");
+    if (!value || !*value) return VDN_WINDOW_BATCH_DEFAULT;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end || parsed < 1 ||
+        parsed > VDN_WINDOW_BATCH_CAP) return VDN_WINDOW_BATCH_DEFAULT;
+    return (unsigned)parsed;
 }
 
 static int gpu_op(h3_dit *dit, int ok, char *error, size_t error_size,
@@ -1572,7 +1583,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         uint64_t kv_rows = dit->video_target_start + window_frames * frame_rows;
         if (kv_rows > dit->sequence) kv_rows = dit->sequence;
         uint64_t kv_bytes = kv_rows * INNER * sizeof(uint16_t);
-        uint64_t batch = VDN_WINDOW_BATCH_CAP;
+        uint64_t batch = vdn_window_batch_limit();
         const uint64_t scratch_limit = 1ull << 30;
         if (kv_bytes && batch * kv_bytes > scratch_limit) {
             batch = scratch_limit / kv_bytes;
